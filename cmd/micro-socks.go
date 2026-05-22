@@ -63,7 +63,7 @@ func main() {
 		}
 	}
 
-	portStr := fmt.Sprintf(":%d", Cfg.Proxy.Port)
+	portStr := fmt.Sprintf("%s:%d", Cfg.Proxy.Address, Cfg.Proxy.Port)
 	listener, err := net.Listen("tcp", portStr)
 	if err != nil {
 		log.Fatalf("Failed to start server: %v", err)

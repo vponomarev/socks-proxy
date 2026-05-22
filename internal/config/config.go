@@ -16,8 +16,8 @@ type Strategy struct {
 }
 
 type Proxy struct {
-	Address string
-	Port    int `yaml:"port"`
+	Address string `yaml:"address"`
+	Port    int    `yaml:"port"`
 }
 
 type FakeSni struct {
