@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"net"
@@ -52,6 +53,12 @@ type whoisCache struct {
 var cache = &whoisCache{
 	items: make(map[string]NetworkInfo),
 }
+
+var (
+	paramPort   = flag.Int("p", 8800, "listen port")
+	paramDaemon = flag.Bool("d", false, "daemon mode")
+	paramHelp   = flag.Bool("h", false, "print help")
+)
 
 // getFromCache retrieves network info from cache
 func (c *whoisCache) getFromCache(ip string) (NetworkInfo, bool) {
@@ -485,15 +492,17 @@ func routeHandler(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	// Check for port parameter
-	if len(os.Args) != 2 {
-		fmt.Printf("Usage: %s <port>\n", os.Args[0])
-		fmt.Println("Example: ./router-server 8080")
-		fmt.Println("\nOptional environment variables:")
+	flag.Parse()
+
+	if *paramHelp {
+		fmt.Printf("Usage: %s [-p <port>][-d]\n", os.Args[0])
+		fmt.Println("Parameters:")
+		fmt.Println("  -p <port> - listen port (default: 8800)")
+		fmt.Println("  -d        - daemon mode")
+		fmt.Println("Optional environment variables:")
 		fmt.Println("  IPINFO_TOKEN - Token for ipinfo.io API (for better AS information)")
 		os.Exit(1)
 	}
-
-	port := os.Args[1]
 
 	// Check if whois is installed
 	_, err := exec.LookPath("whois")
@@ -588,12 +597,12 @@ func main() {
 	})
 
 	// Start server
-	addr := fmt.Sprintf(":%s", port)
-	log.Printf("Server started on port %s", port)
+	addr := fmt.Sprintf(":%d", *paramPort)
+	log.Printf("Server started on port %v", *paramPort)
 	log.Printf("Example requests:")
-	log.Printf("  curl http://localhost:%s/route?ip=8.8.8.8", port)
-	log.Printf("  curl http://localhost:%s/route?ip=google.com", port)
-	log.Printf("  curl http://localhost:%s/route?ip=as13335", port)
+	log.Printf("  curl http://localhost:%v/route?ip=8.8.8.8", *paramPort)
+	log.Printf("  curl http://localhost:%v/route?ip=google.com", *paramPort)
+	log.Printf("  curl http://localhost:%v/route?ip=as13335", *paramPort)
 	log.Printf("\nNote: For better AS information, set IPINFO_TOKEN environment variable")
 
 	log.Fatal(http.ListenAndServe(addr, nil))
