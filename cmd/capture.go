@@ -1,3 +1,5 @@
+//go:build cgo
+
 package main
 
 import (
@@ -24,7 +26,6 @@ type SessionInfo struct {
 
 func setupCapture(ctx context.Context, ifname string) (ok bool, err error, ch chan SessionInfo) {
 	ch = make(chan SessionInfo)
-	SerSentBuffer = make(chan gopacket.SerializeBuffer)
 	devList, err := pcap.FindAllDevs()
 
 	if err != nil {
@@ -51,6 +52,7 @@ func setupCapture(ctx context.Context, ifname string) (ok bool, err error, ch ch
 	if err != nil {
 		return
 	}
+	SerSentBuffer = make(chan gopacket.SerializeBuffer)
 	pSource := gopacket.NewPacketSource(handle, handle.LinkType())
 
 	pChan := pSource.Packets()
@@ -119,6 +121,7 @@ func (r *RingSessionBuffer) Append(si SessionInfo) {
 
 	// Rotate
 	if len(r.Entries) > 500 {
+		copy(r.Entries, r.Entries[len(r.Entries)-500:])
 		r.Entries = r.Entries[:500]
 	}
 

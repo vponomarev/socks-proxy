@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/gopacket"
 	"github.com/vponomarev/socks-proxy/internal/config"
+	"github.com/vponomarev/socks-proxy/internal/routing"
 )
 
 const (
@@ -29,6 +30,7 @@ var (
 	paramTTL      = flag.Int("ttl", 7, "TTL for fake packets")
 	configPath    = flag.String("config", "proxy.yml", "Path to config file, default `proxy.yml`")
 	Cfg           *config.Config
+	LearnedRoutes *routing.Store
 )
 
 func CaptureSessionInfo(conn net.Conn) (ok bool, si SessionInfo) {
@@ -52,6 +54,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("Error loading config file [%s]: %v\n", *configPath, err)
 	}
+	LearnedRoutes, err = routing.Load(Cfg.Detection.LearnedDomainsFile)
+	if err != nil {
+		log.Fatalf("Error loading learned domains: %v\n", err)
+	}
+	log.Printf("Loaded %d learned domain routes", len(LearnedRoutes.Entries()))
 
 	if Cfg.FakeSni.Interface != "" {
 		okCapture, err, chCapture := setupCapture(context.Background(), Cfg.FakeSni.Interface)
@@ -83,8 +90,9 @@ func main() {
 
 		//log.Printf("[%d] New connection from: %s", CntNo, conn.RemoteAddr())
 		inst := Socks5{
-			clientConn: conn,
-			UniqNo:     CntNo,
+			clientConn:    conn,
+			UniqNo:        CntNo,
+			firstResponse: make(chan struct{}),
 		}
 		CntNo++
 		go inst.AcceptConnection()

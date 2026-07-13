@@ -1,21 +1,51 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
+	"github.com/vponomarev/socks-proxy/internal/config"
 	"github.com/vponomarev/socks-proxy/internal/libtls"
+	"github.com/vponomarev/socks-proxy/internal/socksclient"
 )
 
 var (
 	ReplaceCounter NumReplaced
+	FallbackProbes = newProbeCoordinator()
 )
+
+type probeCoordinator struct {
+	mu     sync.Mutex
+	active map[string]struct{}
+}
+
+func newProbeCoordinator() *probeCoordinator {
+	return &probeCoordinator{active: make(map[string]struct{})}
+}
+
+func (p *probeCoordinator) Start(host string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, exists := p.active[host]; exists {
+		return false
+	}
+	p.active[host] = struct{}{}
+	return true
+}
+
+func (p *probeCoordinator) Done(host string) {
+	p.mu.Lock()
+	delete(p.active, host)
+	p.mu.Unlock()
+}
 
 type Socks5 struct {
 	UniqNo uint32
@@ -33,6 +63,10 @@ type Socks5 struct {
 
 	bytesTX int
 	bytesRX int
+
+	Policy        config.ResolvedPolicy
+	firstResponse chan struct{}
+	responseOnce  sync.Once
 	sync.RWMutex
 }
 
@@ -55,6 +89,9 @@ func (n *NumReplaced) Get() int {
 
 func (s *Socks5) AcceptConnection() {
 	defer s.clientConn.Close()
+	if s.firstResponse == nil {
+		s.firstResponse = make(chan struct{})
+	}
 
 	// Аутентификация SOCKS5
 	if err := s.AuthRequest(); err != nil {
@@ -102,6 +139,18 @@ func (s *Socks5) AuthRequest() error {
 	}
 
 	// Поддерживаем только NO AUTH
+	noAuth := false
+	for _, method := range methods {
+		if method == 0 {
+			noAuth = true
+			break
+		}
+	}
+	if !noAuth {
+		s.clientConn.Write([]byte{socksVersion, 0xff})
+		return fmt.Errorf("client did not offer NO AUTH")
+	}
+
 	response := []byte{socksVersion, 0}
 	_, err := s.clientConn.Write(response)
 	return err
@@ -115,6 +164,12 @@ func (s *Socks5) ProcessRequest() error {
 
 	if request[0] != socksVersion {
 		return fmt.Errorf("unsupported SOCKS version: %d", request[0])
+	}
+	if request[1] != 0x01 {
+		return fmt.Errorf("unsupported SOCKS command: %d", request[1])
+	}
+	if request[2] != 0x00 {
+		return fmt.Errorf("invalid reserved byte: %d", request[2])
 	}
 
 	// Читаем адрес назначения
@@ -163,8 +218,25 @@ func (s *Socks5) ProcessRequest() error {
 	}
 
 	// Устанавливаем соединение с целевым сервером
-	targetAddr := fmt.Sprintf("%s:%d", host, port)
-	targetConn, err := net.Dial("tcp", targetAddr)
+	learnedUpstream := ""
+	if LearnedRoutes != nil {
+		if learned, ok := LearnedRoutes.Lookup(s.TargetHost); ok {
+			learnedUpstream = learned.Upstream
+		}
+	}
+	s.Policy = Cfg.PolicyFor(s.TargetHost, learnedUpstream)
+
+	var targetConn net.Conn
+	var err error
+	if s.Policy.Egress == "socks5" {
+		upstream := Cfg.Upstreams[s.Policy.Upstream]
+		ctx, cancel := context.WithTimeout(context.Background(), upstream.Timeout())
+		targetConn, err = socksclient.Dial(ctx, upstream, host, port)
+		cancel()
+	} else {
+		targetAddr := net.JoinHostPort(host, strconv.Itoa(int(port)))
+		targetConn, err = (&net.Dialer{Timeout: 10 * time.Second}).Dial("tcp", targetAddr)
+	}
 	if err != nil {
 		// Отправляем ошибку клиенту
 		response := []byte{socksVersion, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
@@ -173,14 +245,7 @@ func (s *Socks5) ProcessRequest() error {
 	}
 
 	// Отправляем успешный ответ
-	localAddr := targetConn.LocalAddr().(*net.TCPAddr)
-	response := make([]byte, 10)
-	response[0] = socksVersion
-	response[1] = 0x00 // Success
-	response[2] = 0x00 // Reserved
-	response[3] = 0x01 // IPv4
-	copy(response[4:8], localAddr.IP.To4())
-	binary.BigEndian.PutUint16(response[8:10], uint16(localAddr.Port))
+	response := successReply(targetConn.LocalAddr())
 
 	if _, err := s.clientConn.Write(response); err != nil {
 		targetConn.Close()
@@ -191,13 +256,31 @@ func (s *Socks5) ProcessRequest() error {
 	s.ConnTargetIP = s.targetConn.RemoteAddr().(*net.TCPAddr).IP.String()
 	s.connectedAt = time.Now()
 
-	log.Printf("[%d][%s] [%s => %s] CONNECT to: %s:%v",
+	log.Printf("[%d][%s] [%s => %s] CONNECT to: %s:%v policy=%s egress=%s upstream=%s dpi=%s",
 		s.UniqNo,
 		s.clientConn.RemoteAddr().String(),
 		s.targetConn.LocalAddr().String(),
 		s.targetConn.RemoteAddr().String(),
-		s.TargetHost, s.TargetPort)
+		s.TargetHost, s.TargetPort, s.Policy.Name, s.Policy.Egress, s.Policy.Upstream, s.Policy.DPI)
 	return nil
+}
+
+func successReply(addr net.Addr) []byte {
+	tcpAddr, ok := addr.(*net.TCPAddr)
+	if !ok {
+		return []byte{socksVersion, 0, 0, 1, 0, 0, 0, 0, 0, 0}
+	}
+	if ip4 := tcpAddr.IP.To4(); ip4 != nil {
+		response := []byte{socksVersion, 0, 0, 1, 0, 0, 0, 0, 0, 0}
+		copy(response[4:8], ip4)
+		binary.BigEndian.PutUint16(response[8:10], uint16(tcpAddr.Port))
+		return response
+	}
+	response := make([]byte, 22)
+	response[0], response[1], response[2], response[3] = socksVersion, 0, 0, 4
+	copy(response[4:20], tcpAddr.IP.To16())
+	binary.BigEndian.PutUint16(response[20:22], uint16(tcpAddr.Port))
+	return response
 }
 
 func (s *Socks5) UpdateMetrics(tx, rx int) {
@@ -221,6 +304,9 @@ func (s *Socks5) StreamReverse() {
 		n, err := s.targetConn.Read(buffer)
 		cntBytes += n
 		s.UpdateMetrics(0, n)
+		if n > 0 {
+			s.responseOnce.Do(func() { close(s.firstResponse) })
+		}
 		if err != nil {
 			if err != io.EOF {
 				//log.Printf("[%d] Read error [reverse]: %v", s.UniqNo, err)
@@ -230,7 +316,7 @@ func (s *Socks5) StreamReverse() {
 			break
 		}
 
-		if _, err := s.clientConn.Write(buffer[0:n]); err != nil {
+		if err := writeConn(s.clientConn, buffer[0:n]); err != nil {
 			//log.Printf("[%d] Write error [reverse]: %v", s.UniqNo, err)
 			break
 		}
@@ -280,6 +366,187 @@ func (s *Socks5) DoInject(data []byte) {
 }
 
 func (s *Socks5) StreamForward() {
+	defer s.targetConn.Close()
+	buffer := make([]byte, 32*1024)
+	fragmenter := NewFragmenter(initialFragSize)
+	tlsBuffer := make([]byte, 0, 64*1024)
+	inspectionDone := false
+	probeStarted := false
+
+	for {
+		n, err := s.clientConn.Read(buffer)
+		if n > 0 {
+			data := buffer[:n]
+			var candidate []byte
+			candidateHost := ""
+
+			if !inspectionDone {
+				if len(tlsBuffer)+n <= cap(tlsBuffer) {
+					tlsBuffer = append(tlsBuffer, data...)
+				} else {
+					inspectionDone = true
+				}
+				if !inspectionDone && len(tlsBuffer) >= 5 {
+					if tlsBuffer[0] != 0x16 {
+						inspectionDone = true
+					} else {
+						recordLength := 5 + int(binary.BigEndian.Uint16(tlsBuffer[3:5]))
+						if len(tlsBuffer) >= recordLength {
+							recordData := append([]byte(nil), tlsBuffer[:recordLength]...)
+							tlsRecord, decodeErr := libtls.DecodeTLS(recordData)
+							if decodeErr == nil {
+								_, sni := tlsRecord.Message.FindSNI()
+								candidateHost = s.TargetHost
+								if s.IsTargetIP && sni != "" {
+									candidateHost = sni
+								}
+								log.Printf("[%d] event=tls_client_hello target=%s sni=%s", s.UniqNo, s.TargetHost, sni)
+								if s.Policy.DPI == "fake-sni" {
+									s.injectFakePacket(tlsRecord)
+								}
+								if s.Policy.Egress == "direct" && s.Policy.Fallback != "" && s.Policy.Fallback != "none" {
+									candidate = recordData
+								}
+							}
+							inspectionDone = true
+						}
+					}
+				}
+			}
+
+			var writeErr error
+			if s.Policy.DPI == "fragment" && fragmenter.ShouldFragment() {
+				writeErr = fragmenter.WriteFragmented(s.targetConn, data)
+			} else {
+				writeErr = writeConn(s.targetConn, data)
+			}
+			s.UpdateMetrics(n, 0)
+			if writeErr != nil {
+				break
+			}
+			if len(candidate) > 0 && candidateHost != "" && !probeStarted {
+				probeStarted = true
+				go s.monitorBlockCandidate(candidateHost, candidate)
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+}
+
+func (s *Socks5) injectFakePacket(tlsRecord *libtls.TLSRecord) {
+	if SerSentBuffer == nil || s.TargetPort != 443 {
+		return
+	}
+	ok, hostname := tlsRecord.Message.FindSNI()
+	if !ok || hostname == "" {
+		return
+	}
+	decoyName := hostname[:len(hostname)-1] + "x"
+	tlsRecord.Message.ReplaceSNI(decoyName)
+	data, err := tlsRecord.EncodeTLS()
+	if err != nil {
+		log.Printf("[%d] event=fake_sni_encode_failed error=%v", s.UniqNo, err)
+		return
+	}
+
+	time.Sleep(30 * time.Millisecond)
+	ok, session := CaptureSessionInfo(s.targetConn)
+	if !ok {
+		log.Printf("[%d] event=fake_sni_session_not_found", s.UniqNo)
+		return
+	}
+	ttl := Cfg.FakeSni.Ttl
+	if ttl == 0 {
+		ttl = *paramTTL
+	}
+	ttl = s.Policy.TTL(ttl)
+	err, packet := PrepareFakePacket(session, uint8(ttl), data)
+	if err != nil {
+		log.Printf("[%d] event=fake_sni_packet_failed error=%v", s.UniqNo, err)
+		return
+	}
+	SerSentBuffer <- packet
+	log.Printf("[%d] event=fake_sni_injected bytes=%d ttl=%d", s.UniqNo, len(data), ttl)
+	time.Sleep(30 * time.Millisecond)
+}
+
+func (s *Socks5) monitorBlockCandidate(host string, clientHello []byte) {
+	timer := time.NewTimer(Cfg.Detection.ResponseTimeout())
+	defer timer.Stop()
+	select {
+	case <-s.firstResponse:
+		return
+	case <-timer.C:
+	}
+	if !FallbackProbes.Start(host) {
+		log.Printf("[%d] event=fallback_probe_skipped reason=already_in_progress host=%s", s.UniqNo, host)
+		return
+	}
+	defer FallbackProbes.Done(host)
+
+	log.Printf("[%d] event=block_candidate host=%s target_ip=%s fallback=%s", s.UniqNo, host, s.ConnTargetIP, s.Policy.Fallback)
+	upstream, ok := Cfg.Upstreams[s.Policy.Fallback]
+	if !ok {
+		log.Printf("[%d] event=fallback_configuration_error upstream=%s", s.UniqNo, s.Policy.Fallback)
+		return
+	}
+	probeTimeout := Cfg.Detection.FallbackProbeTimeout()
+	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+	defer cancel()
+	probeConn, err := socksclient.Dial(ctx, upstream, s.TargetHost, s.TargetPort)
+	if err != nil {
+		log.Printf("[%d] event=fallback_connect_failed host=%s upstream=%s error=%v", s.UniqNo, host, s.Policy.Fallback, err)
+		return
+	}
+	defer probeConn.Close()
+	if err := probeConn.SetDeadline(time.Now().Add(probeTimeout)); err != nil {
+		return
+	}
+	if err := writeConn(probeConn, clientHello); err != nil {
+		log.Printf("[%d] event=fallback_write_failed host=%s upstream=%s error=%v", s.UniqNo, host, s.Policy.Fallback, err)
+		return
+	}
+	response := make([]byte, 1)
+	if _, err := io.ReadFull(probeConn, response); err != nil {
+		log.Printf("[%d] event=fallback_probe_failed host=%s upstream=%s error=%v", s.UniqNo, host, s.Policy.Fallback, err)
+		return
+	}
+	select {
+	case <-s.firstResponse:
+		log.Printf("[%d] event=fallback_ignored reason=direct_response_received host=%s", s.UniqNo, host)
+		return
+	default:
+	}
+
+	added, err := LearnedRoutes.Add(host, s.Policy.Fallback, "direct-timeout-upstream-success")
+	if err != nil {
+		log.Printf("[%d] event=learned_domain_write_failed host=%s error=%v", s.UniqNo, host, err)
+		return
+	}
+	log.Printf("[%d] event=fallback_success host=%s upstream=%s learned=%t", s.UniqNo, host, s.Policy.Fallback, added)
+	// The browser performs the retry. Closing both sides makes the failed
+	// attempt finish promptly; the next connection uses the learned upstream.
+	s.targetConn.Close()
+	s.clientConn.Close()
+}
+
+func writeConn(conn net.Conn, data []byte) error {
+	for len(data) > 0 {
+		n, err := conn.Write(data)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrUnexpectedEOF
+		}
+		data = data[n:]
+	}
+	return nil
+}
+
+func (s *Socks5) streamForwardLegacy() {
 	buffer := make([]byte, 32*1024) // 32KB buffer
 	cntBytes := 0
 
@@ -295,7 +562,7 @@ func (s *Socks5) StreamForward() {
 				ok, hostname := tls.Message.FindSNI()
 				if ok {
 					fmt.Printf("TLS SNI Hostname: %v\n", hostname)
-					if hostname == "example-site.ru" {
+					if false {
 						//tls.Message.ReplaceSNI("example-site.rx")
 						tls.Message.RemoveSNI()
 

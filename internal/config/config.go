@@ -3,6 +3,10 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
 
 	"gopkg.in/yaml.v2"
 )
@@ -11,6 +15,10 @@ type Strategy struct {
 	Name        string            `yaml:"name"`
 	List        string            `yaml:"list"`
 	Action      string            `yaml:"action"`
+	Egress      string            `yaml:"egress"`
+	DPI         string            `yaml:"dpi"`
+	Upstream    string            `yaml:"upstream"`
+	Fallback    string            `yaml:"fallback"`
 	Params      map[string]string `yaml:"params"`
 	ListRecords []DomainRecord    `yaml:"-"`
 }
@@ -25,10 +33,55 @@ type FakeSni struct {
 	Ttl       int    `yaml:"ttl"`
 }
 
+type Upstream struct {
+	Address        string `yaml:"address"`
+	Username       string `yaml:"username"`
+	Password       string `yaml:"password"`
+	ConnectTimeout string `yaml:"connect-timeout"`
+}
+
+func (u Upstream) Timeout() time.Duration {
+	return parseDuration(u.ConnectTimeout, 5*time.Second)
+}
+
+type Detection struct {
+	FirstResponseTimeout string `yaml:"first-response-timeout"`
+	ProbeTimeout         string `yaml:"probe-timeout"`
+	FallbackUpstream     string `yaml:"fallback-upstream"`
+	LearnedDomainsFile   string `yaml:"learned-domains-file"`
+}
+
+func (d Detection) ResponseTimeout() time.Duration {
+	return parseDuration(d.FirstResponseTimeout, 3*time.Second)
+}
+
+func (d Detection) FallbackProbeTimeout() time.Duration {
+	return parseDuration(d.ProbeTimeout, 5*time.Second)
+}
+
+type DefaultPolicy struct {
+	Egress   string `yaml:"egress"`
+	DPI      string `yaml:"dpi"`
+	Upstream string `yaml:"upstream"`
+	Fallback string `yaml:"fallback"`
+}
+
+type ResolvedPolicy struct {
+	Name     string
+	Egress   string
+	DPI      string
+	Upstream string
+	Fallback string
+	Params   map[string]string
+}
+
 type Config struct {
-	Proxy    Proxy
-	FakeSni  FakeSni `yaml:"fake-sni"`
-	Strategy []Strategy
+	Proxy     Proxy               `yaml:"proxy"`
+	FakeSni   FakeSni             `yaml:"fake-sni"`
+	Upstreams map[string]Upstream `yaml:"upstreams"`
+	Detection Detection           `yaml:"detection"`
+	Default   DefaultPolicy       `yaml:"default"`
+	Strategy  []Strategy          `yaml:"strategy"`
 }
 
 func LoadConfig(path string) (config *Config, err error) {
@@ -47,9 +100,30 @@ func LoadConfig(path string) (config *Config, err error) {
 		return nil, err
 	}
 
-	// Load all lists
+	baseDir, err := filepath.Abs(filepath.Dir(path))
+	if err != nil {
+		return nil, err
+	}
+
+	if config.Default.Egress == "" {
+		config.Default.Egress = "direct"
+	}
+	if config.Default.DPI == "" {
+		config.Default.DPI = "none"
+	}
+	if config.Detection.FallbackUpstream != "" && config.Detection.LearnedDomainsFile == "" {
+		config.Detection.LearnedDomainsFile = filepath.Join(baseDir, "learned-domains.yml")
+	} else if config.Detection.LearnedDomainsFile != "" && !filepath.IsAbs(config.Detection.LearnedDomainsFile) {
+		config.Detection.LearnedDomainsFile = filepath.Join(baseDir, config.Detection.LearnedDomainsFile)
+	}
+
+	// Load all lists. Relative paths are resolved from the configuration file.
 	for i := range config.Strategy {
+		config.normalizeStrategy(&config.Strategy[i])
 		if config.Strategy[i].List != "" {
+			if !filepath.IsAbs(config.Strategy[i].List) {
+				config.Strategy[i].List = filepath.Join(baseDir, config.Strategy[i].List)
+			}
 			dl := DomainList{}
 			err = dl.Load(config.Strategy[i].List)
 			if err != nil {
@@ -59,8 +133,158 @@ func LoadConfig(path string) (config *Config, err error) {
 		}
 	}
 
+	if err := config.Validate(); err != nil {
+		return nil, err
+	}
+
 	return config, nil
 
+}
+
+func (c *Config) normalizeStrategy(s *Strategy) {
+	if s.Egress == "" {
+		switch strings.ToLower(s.Action) {
+		case "socks5":
+			s.Egress = "socks5"
+		case "direct", "":
+			s.Egress = "direct"
+		default:
+			s.Egress = "direct"
+		}
+	}
+	if s.DPI == "" {
+		switch strings.ToLower(s.Action) {
+		case "fake-sni", "fragment":
+			s.DPI = strings.ToLower(s.Action)
+		default:
+			s.DPI = "none"
+		}
+	}
+	if s.Upstream == "" && s.Params != nil {
+		s.Upstream = s.Params["upstream"]
+	}
+	if s.Fallback == "" {
+		s.Fallback = c.Detection.FallbackUpstream
+	}
+}
+
+func (c *Config) Validate() error {
+	for name, upstream := range c.Upstreams {
+		if strings.TrimSpace(upstream.Address) == "" {
+			return fmt.Errorf("upstream %q has no address", name)
+		}
+		if upstream.ConnectTimeout != "" {
+			if _, err := time.ParseDuration(upstream.ConnectTimeout); err != nil {
+				return fmt.Errorf("upstream %q connect-timeout: %w", name, err)
+			}
+		}
+	}
+	if c.Detection.FirstResponseTimeout != "" {
+		if _, err := time.ParseDuration(c.Detection.FirstResponseTimeout); err != nil {
+			return fmt.Errorf("detection first-response-timeout: %w", err)
+		}
+	}
+	if c.Detection.ProbeTimeout != "" {
+		if _, err := time.ParseDuration(c.Detection.ProbeTimeout); err != nil {
+			return fmt.Errorf("detection probe-timeout: %w", err)
+		}
+	}
+	for _, s := range c.Strategy {
+		if err := c.validatePolicy(s.Name, s.Egress, s.DPI, s.Upstream, s.Fallback); err != nil {
+			return err
+		}
+	}
+	return c.validatePolicy("default", c.Default.Egress, c.Default.DPI, c.Default.Upstream, c.Default.Fallback)
+}
+
+func (c *Config) validatePolicy(name, egress, dpi, upstream, fallback string) error {
+	if egress != "direct" && egress != "socks5" {
+		return fmt.Errorf("policy %q has unsupported egress %q", name, egress)
+	}
+	if dpi != "none" && dpi != "fragment" && dpi != "fake-sni" {
+		return fmt.Errorf("policy %q has unsupported dpi mode %q", name, dpi)
+	}
+	if egress == "socks5" {
+		if _, ok := c.Upstreams[upstream]; !ok {
+			return fmt.Errorf("policy %q references unknown upstream %q", name, upstream)
+		}
+	}
+	if fallback != "" && fallback != "none" {
+		if _, ok := c.Upstreams[fallback]; !ok {
+			return fmt.Errorf("policy %q references unknown fallback %q", name, fallback)
+		}
+	}
+	return nil
+}
+
+func (c *Config) PolicyFor(host string, learnedUpstream string) ResolvedPolicy {
+	policy := ResolvedPolicy{
+		Name:     "default",
+		Egress:   c.Default.Egress,
+		DPI:      c.Default.DPI,
+		Upstream: c.Default.Upstream,
+		Fallback: c.Default.Fallback,
+	}
+	if policy.Fallback == "" {
+		policy.Fallback = c.Detection.FallbackUpstream
+	}
+
+	for _, strategy := range c.Strategy {
+		if strategy.matches(host) {
+			policy = ResolvedPolicy{
+				Name:     strategy.Name,
+				Egress:   strategy.Egress,
+				DPI:      strategy.DPI,
+				Upstream: strategy.Upstream,
+				Fallback: strategy.Fallback,
+				Params:   strategy.Params,
+			}
+			break
+		}
+	}
+
+	// A statically selected SOCKS5 upstream always wins. Learned routing only
+	// replaces direct policies which permit fallback.
+	_, learnedUpstreamExists := c.Upstreams[learnedUpstream]
+	if learnedUpstreamExists && policy.Egress != "socks5" && policy.Fallback != "none" {
+		policy.Name = "learned-domain"
+		policy.Egress = "socks5"
+		policy.DPI = "none"
+		policy.Upstream = learnedUpstream
+	}
+	return policy
+}
+
+func (s Strategy) matches(host string) bool {
+	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	for _, record := range s.ListRecords {
+		if record.Regexp != nil && record.Regexp.MatchString(host) {
+			return true
+		}
+	}
+	return false
+}
+
+func (p ResolvedPolicy) TTL(defaultTTL int) int {
+	if p.Params == nil || p.Params["ttl"] == "" {
+		return defaultTTL
+	}
+	ttl, err := strconv.Atoi(p.Params["ttl"])
+	if err != nil || ttl < 1 || ttl > 255 {
+		return defaultTTL
+	}
+	return ttl
+}
+
+func parseDuration(value string, fallback time.Duration) time.Duration {
+	if value == "" {
+		return fallback
+	}
+	d, err := time.ParseDuration(value)
+	if err != nil {
+		return fallback
+	}
+	return d
 }
 
 func (c *Config) IsFakeStrategy(targetHost string) (ok bool, replace string) {

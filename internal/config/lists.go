@@ -107,10 +107,9 @@ func TemplateToRegex(template string) (*regexp.Regexp, error) {
 
 	// Handle the wildcard subdomain case (starts with dot)
 	if strings.HasPrefix(template, ".") {
-		// Remove the escaped dot prefix we added with QuoteMeta
 		escaped = strings.TrimPrefix(escaped, "\\.")
-		// Pattern: any non-dot characters followed by the domain
-		pattern := "^[^.]+\\.?" + escaped + "$"
+		// A leading dot means the base domain and any depth of subdomain.
+		pattern := "^(?:[^.]+\\.)*" + escaped + "$"
 		return regexp.Compile(pattern)
 	}
 
