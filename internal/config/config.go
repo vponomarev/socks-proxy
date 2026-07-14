@@ -49,6 +49,7 @@ type Detection struct {
 	ProbeTimeout         string `yaml:"probe-timeout"`
 	FallbackUpstream     string `yaml:"fallback-upstream"`
 	LearnedDomainsFile   string `yaml:"learned-domains-file"`
+	LearnedDomainTTL     string `yaml:"learned-domain-ttl"`
 }
 
 func (d Detection) ResponseTimeout() time.Duration {
@@ -57,6 +58,19 @@ func (d Detection) ResponseTimeout() time.Duration {
 
 func (d Detection) FallbackProbeTimeout() time.Duration {
 	return parseDuration(d.ProbeTimeout, 5*time.Second)
+}
+
+func (d Detection) LearnedTTL() time.Duration {
+	return parseDuration(d.LearnedDomainTTL, 0)
+}
+
+type Admin struct {
+	Address string `yaml:"address"`
+	Port    int    `yaml:"port"`
+}
+
+func (a Admin) Enabled() bool {
+	return a.Port > 0
 }
 
 type DefaultPolicy struct {
@@ -77,6 +91,7 @@ type ResolvedPolicy struct {
 
 type Config struct {
 	Proxy     Proxy               `yaml:"proxy"`
+	Admin     Admin               `yaml:"admin"`
 	FakeSni   FakeSni             `yaml:"fake-sni"`
 	Upstreams map[string]Upstream `yaml:"upstreams"`
 	Detection Detection           `yaml:"detection"`
@@ -110,6 +125,9 @@ func LoadConfig(path string) (config *Config, err error) {
 	}
 	if config.Default.DPI == "" {
 		config.Default.DPI = "none"
+	}
+	if config.Admin.Enabled() && config.Admin.Address == "" {
+		config.Admin.Address = "127.0.0.1"
 	}
 	if config.Detection.FallbackUpstream != "" && config.Detection.LearnedDomainsFile == "" {
 		config.Detection.LearnedDomainsFile = filepath.Join(baseDir, "learned-domains.yml")
@@ -188,6 +206,18 @@ func (c *Config) Validate() error {
 		if _, err := time.ParseDuration(c.Detection.ProbeTimeout); err != nil {
 			return fmt.Errorf("detection probe-timeout: %w", err)
 		}
+	}
+	if c.Detection.LearnedDomainTTL != "" {
+		ttl, err := time.ParseDuration(c.Detection.LearnedDomainTTL)
+		if err != nil {
+			return fmt.Errorf("detection learned-domain-ttl: %w", err)
+		}
+		if ttl < 0 {
+			return fmt.Errorf("detection learned-domain-ttl must not be negative")
+		}
+	}
+	if c.Admin.Port < 0 || c.Admin.Port > 65535 {
+		return fmt.Errorf("admin port must be between 1 and 65535")
 	}
 	for _, s := range c.Strategy {
 		if err := c.validatePolicy(s.Name, s.Egress, s.DPI, s.Upstream, s.Fallback); err != nil {

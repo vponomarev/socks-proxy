@@ -13,10 +13,12 @@ import (
 )
 
 type LearnedDomain struct {
-	Host      string    `yaml:"host"`
-	Upstream  string    `yaml:"upstream"`
-	LearnedAt time.Time `yaml:"learned-at"`
-	Reason    string    `yaml:"reason"`
+	Host       string    `yaml:"host" json:"host"`
+	Upstream   string    `yaml:"upstream" json:"upstream"`
+	LearnedAt  time.Time `yaml:"learned-at" json:"learned_at"`
+	LastUsedAt time.Time `yaml:"last-used-at,omitempty" json:"last_used_at,omitempty"`
+	HitCount   uint64    `yaml:"hit-count,omitempty" json:"hit_count"`
+	Reason     string    `yaml:"reason" json:"reason"`
 }
 
 type learnedFile struct {
@@ -31,6 +33,7 @@ type Store struct {
 	mu      sync.RWMutex
 	path    string
 	domains map[string]LearnedDomain
+	dirty   bool
 }
 
 func Load(path string) (*Store, error) {
@@ -70,6 +73,33 @@ func (s *Store) Lookup(host string) (LearnedDomain, bool) {
 	return entry, ok
 }
 
+// LookupActive returns a learned route unless it is older than ttl. A zero TTL
+// disables expiration. Expired entries are removed by PruneExpired.
+func (s *Store) LookupActive(host string, ttl time.Duration, now time.Time) (LearnedDomain, bool) {
+	entry, ok := s.Lookup(host)
+	if !ok || (ttl > 0 && now.Sub(entry.LearnedAt) >= ttl) {
+		return LearnedDomain{}, false
+	}
+	return entry, true
+}
+
+// MarkUsed updates in-memory usage data. Flush persists batched updates so a
+// busy proxy does not rewrite the YAML file for every connection.
+func (s *Store) MarkUsed(host string, now time.Time) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	host = normalizeHost(host)
+	entry, ok := s.domains[host]
+	if !ok {
+		return false
+	}
+	entry.HitCount++
+	entry.LastUsedAt = now
+	s.domains[host] = entry
+	s.dirty = true
+	return true
+}
+
 func (s *Store) Add(host, upstream, reason string) (bool, error) {
 	host = normalizeHost(host)
 	if host == "" {
@@ -99,7 +129,64 @@ func (s *Store) Add(host, upstream, reason string) (bool, error) {
 		}
 		return false, err
 	}
+	s.dirty = false
 	return true, nil
+}
+
+func (s *Store) Delete(host string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	host = normalizeHost(host)
+	entry, existed := s.domains[host]
+	if !existed {
+		return false, nil
+	}
+	delete(s.domains, host)
+	if err := s.saveLocked(); err != nil {
+		s.domains[host] = entry
+		return false, err
+	}
+	s.dirty = false
+	return true, nil
+}
+
+func (s *Store) PruneExpired(ttl time.Duration, now time.Time) (int, error) {
+	if ttl <= 0 {
+		return 0, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	removed := make(map[string]LearnedDomain)
+	for host, entry := range s.domains {
+		if now.Sub(entry.LearnedAt) >= ttl {
+			removed[host] = entry
+			delete(s.domains, host)
+		}
+	}
+	if len(removed) == 0 {
+		return 0, nil
+	}
+	if err := s.saveLocked(); err != nil {
+		for host, entry := range removed {
+			s.domains[host] = entry
+		}
+		return 0, err
+	}
+	s.dirty = false
+	return len(removed), nil
+}
+
+func (s *Store) Flush() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.dirty {
+		return nil
+	}
+	if err := s.saveLocked(); err != nil {
+		return err
+	}
+	s.dirty = false
+	return nil
 }
 
 func (s *Store) Entries() []LearnedDomain {

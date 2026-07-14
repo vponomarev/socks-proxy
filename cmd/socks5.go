@@ -89,6 +89,15 @@ func (n *NumReplaced) Get() int {
 
 func (s *Socks5) AcceptConnection() {
 	defer s.clientConn.Close()
+	sessionStarted := time.Now()
+	sessionResult := "failed"
+	if ProxyMetrics != nil {
+		ProxyMetrics.SessionStarted()
+		defer func() {
+			tx, rx := s.GetMetrics()
+			ProxyMetrics.SessionFinished(tx, rx, time.Since(sessionStarted), s.Policy.Egress, sessionResult)
+		}()
+	}
 	if s.firstResponse == nil {
 		s.firstResponse = make(chan struct{})
 	}
@@ -106,6 +115,7 @@ func (s *Socks5) AcceptConnection() {
 		return
 	}
 	defer s.targetConn.Close()
+	sessionResult = "completed"
 
 	// Start packet processing
 	go s.StreamForward()
@@ -220,7 +230,7 @@ func (s *Socks5) ProcessRequest() error {
 	// Устанавливаем соединение с целевым сервером
 	learnedUpstream := ""
 	if LearnedRoutes != nil {
-		if learned, ok := LearnedRoutes.Lookup(s.TargetHost); ok {
+		if learned, ok := LearnedRoutes.LookupActive(s.TargetHost, Cfg.Detection.LearnedTTL(), time.Now()); ok {
 			learnedUpstream = learned.Upstream
 		}
 	}
@@ -228,6 +238,7 @@ func (s *Socks5) ProcessRequest() error {
 
 	var targetConn net.Conn
 	var err error
+	dialStarted := time.Now()
 	if s.Policy.Egress == "socks5" {
 		upstream := Cfg.Upstreams[s.Policy.Upstream]
 		ctx, cancel := context.WithTimeout(context.Background(), upstream.Timeout())
@@ -236,6 +247,13 @@ func (s *Socks5) ProcessRequest() error {
 	} else {
 		targetAddr := net.JoinHostPort(host, strconv.Itoa(int(port)))
 		targetConn, err = (&net.Dialer{Timeout: 10 * time.Second}).Dial("tcp", targetAddr)
+	}
+	if ProxyMetrics != nil {
+		result := "success"
+		if err != nil {
+			result = "failure"
+		}
+		ProxyMetrics.ObserveDial(s.Policy.Egress, s.Policy.Upstream, result, time.Since(dialStarted))
 	}
 	if err != nil {
 		// Отправляем ошибку клиенту
@@ -255,6 +273,12 @@ func (s *Socks5) ProcessRequest() error {
 	s.targetConn = targetConn
 	s.ConnTargetIP = s.targetConn.RemoteAddr().(*net.TCPAddr).IP.String()
 	s.connectedAt = time.Now()
+	if ProxyMetrics != nil {
+		ProxyMetrics.RouteDecision(s.Policy.Name, s.Policy.Egress, s.Policy.Upstream)
+	}
+	if s.Policy.Name == "learned-domain" && LearnedRoutes != nil {
+		LearnedRoutes.MarkUsed(s.TargetHost, time.Now())
+	}
 
 	log.Printf("[%d][%s] [%s => %s] CONNECT to: %s:%v policy=%s egress=%s upstream=%s dpi=%s",
 		s.UniqNo,
@@ -482,14 +506,23 @@ func (s *Socks5) monitorBlockCandidate(host string, clientHello []byte) {
 	}
 	if !FallbackProbes.Start(host) {
 		log.Printf("[%d] event=fallback_probe_skipped reason=already_in_progress host=%s", s.UniqNo, host)
+		if ProxyMetrics != nil {
+			ProxyMetrics.FallbackResult("skipped_in_progress", s.Policy.Fallback)
+		}
 		return
 	}
 	defer FallbackProbes.Done(host)
 
 	log.Printf("[%d] event=block_candidate host=%s target_ip=%s fallback=%s", s.UniqNo, host, s.ConnTargetIP, s.Policy.Fallback)
+	if ProxyMetrics != nil {
+		ProxyMetrics.FallbackResult("block_candidate", s.Policy.Fallback)
+	}
 	upstream, ok := Cfg.Upstreams[s.Policy.Fallback]
 	if !ok {
 		log.Printf("[%d] event=fallback_configuration_error upstream=%s", s.UniqNo, s.Policy.Fallback)
+		if ProxyMetrics != nil {
+			ProxyMetrics.FallbackResult("configuration_error", s.Policy.Fallback)
+		}
 		return
 	}
 	probeTimeout := Cfg.Detection.FallbackProbeTimeout()
@@ -498,6 +531,9 @@ func (s *Socks5) monitorBlockCandidate(host string, clientHello []byte) {
 	probeConn, err := socksclient.Dial(ctx, upstream, s.TargetHost, s.TargetPort)
 	if err != nil {
 		log.Printf("[%d] event=fallback_connect_failed host=%s upstream=%s error=%v", s.UniqNo, host, s.Policy.Fallback, err)
+		if ProxyMetrics != nil {
+			ProxyMetrics.FallbackResult("connect_failed", s.Policy.Fallback)
+		}
 		return
 	}
 	defer probeConn.Close()
@@ -506,16 +542,25 @@ func (s *Socks5) monitorBlockCandidate(host string, clientHello []byte) {
 	}
 	if err := writeConn(probeConn, clientHello); err != nil {
 		log.Printf("[%d] event=fallback_write_failed host=%s upstream=%s error=%v", s.UniqNo, host, s.Policy.Fallback, err)
+		if ProxyMetrics != nil {
+			ProxyMetrics.FallbackResult("write_failed", s.Policy.Fallback)
+		}
 		return
 	}
 	response := make([]byte, 1)
 	if _, err := io.ReadFull(probeConn, response); err != nil {
 		log.Printf("[%d] event=fallback_probe_failed host=%s upstream=%s error=%v", s.UniqNo, host, s.Policy.Fallback, err)
+		if ProxyMetrics != nil {
+			ProxyMetrics.FallbackResult("probe_failed", s.Policy.Fallback)
+		}
 		return
 	}
 	select {
 	case <-s.firstResponse:
 		log.Printf("[%d] event=fallback_ignored reason=direct_response_received host=%s", s.UniqNo, host)
+		if ProxyMetrics != nil {
+			ProxyMetrics.FallbackResult("direct_won", s.Policy.Fallback)
+		}
 		return
 	default:
 	}
@@ -523,9 +568,16 @@ func (s *Socks5) monitorBlockCandidate(host string, clientHello []byte) {
 	added, err := LearnedRoutes.Add(host, s.Policy.Fallback, "direct-timeout-upstream-success")
 	if err != nil {
 		log.Printf("[%d] event=learned_domain_write_failed host=%s error=%v", s.UniqNo, host, err)
+		if ProxyMetrics != nil {
+			ProxyMetrics.FallbackResult("learn_write_failed", s.Policy.Fallback)
+		}
 		return
 	}
 	log.Printf("[%d] event=fallback_success host=%s upstream=%s learned=%t", s.UniqNo, host, s.Policy.Fallback, added)
+	if ProxyMetrics != nil {
+		ProxyMetrics.FallbackResult("success", s.Policy.Fallback)
+		ProxyMetrics.SetLearnedRoutes(len(LearnedRoutes.Entries()))
+	}
 	// The browser performs the retry. Closing both sides makes the failed
 	// attempt finish promptly; the next connection uses the learned upstream.
 	s.targetConn.Close()

@@ -2,6 +2,11 @@ proxy:
   address: "0.0.0.0"
   port: 1080
 
+# Keep the unauthenticated admin interface on localhost.
+admin:
+  address: "127.0.0.1"
+  port: 9090
+
 # Configure any number of named SOCKS5 upstreams. The same binary can run as
 # the VPN upstream with the minimal vpn-proxy.example.yml configuration.
 upstreams:
@@ -17,6 +22,9 @@ detection:
   probe-timeout: 5s
   fallback-upstream: vpn
   learned-domains-file: learned-domains.yml
+  # Expired entries are removed and may be learned again, revalidating direct.
+  # Omit or set to 0s to keep learned entries indefinitely.
+  learned-domain-ttl: 168h
 
 default:
   egress: direct

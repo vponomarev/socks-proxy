@@ -30,7 +30,7 @@ Follow idiomatic Go and let `gofmt` define tabs and alignment. Use short, lower-
 
 ## Testing Guidelines
 
-No tests are currently committed. Add table-driven tests in `*_test.go` beside the code under test, using `TestXxx` names and the standard `testing` package. Prioritize domain-list matching, TLS encoding, SOCKS request parsing, and route validation. Run `go test ./...` before submitting; use `go test -race ./...` for concurrency changes.
+Tests use Go's standard `testing` and `httptest` packages and live beside the code in `*_test.go`. Use `TestXxx` names and table-driven cases where appropriate. End-to-end SOCKS tests are under `cmd/`; configuration, routing persistence, admin API, and metrics have focused tests under `internal/`. Run `go test ./...` before submitting; use `go test -race ./...` for concurrency changes when the local CGO toolchain supports it.
 
 ## Commit & Pull Request Guidelines
 
