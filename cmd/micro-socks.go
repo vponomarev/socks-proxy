@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"time"
 
 	"github.com/google/gopacket"
+	"github.com/vponomarev/socks-proxy/internal/admin"
 	"github.com/vponomarev/socks-proxy/internal/config"
+	"github.com/vponomarev/socks-proxy/internal/monitor"
 	"github.com/vponomarev/socks-proxy/internal/routing"
 )
 
@@ -31,6 +34,7 @@ var (
 	configPath    = flag.String("config", "proxy.yml", "Path to config file, default `proxy.yml`")
 	Cfg           *config.Config
 	LearnedRoutes *routing.Store
+	ProxyMetrics  *monitor.Monitor
 )
 
 func CaptureSessionInfo(conn net.Conn) (ok bool, si SessionInfo) {
@@ -58,7 +62,23 @@ func main() {
 	if err != nil {
 		log.Fatalf("Error loading learned domains: %v\n", err)
 	}
+	ttl := Cfg.Detection.LearnedTTL()
+	if removed, pruneErr := LearnedRoutes.PruneExpired(ttl, time.Now()); pruneErr != nil {
+		log.Fatalf("Error pruning learned domains: %v", pruneErr)
+	} else if removed > 0 {
+		log.Printf("Pruned %d expired learned domain routes", removed)
+	}
+	ProxyMetrics = monitor.New()
+	ProxyMetrics.SetLearnedRoutes(len(LearnedRoutes.Entries()))
 	log.Printf("Loaded %d learned domain routes", len(LearnedRoutes.Entries()))
+	go maintainLearnedRoutes(ttl)
+
+	if Cfg.Admin.Enabled() {
+		if _, err := admin.Start(Cfg.Admin, ProxyMetrics, LearnedRoutes, ttl); err != nil {
+			log.Fatalf("Failed to start admin server: %v", err)
+		}
+		log.Printf("Admin dashboard started on http://%s:%d/", Cfg.Admin.Address, Cfg.Admin.Port)
+	}
 
 	if Cfg.FakeSni.Interface != "" {
 		okCapture, err, chCapture := setupCapture(context.Background(), Cfg.FakeSni.Interface)
@@ -96,5 +116,30 @@ func main() {
 		}
 		CntNo++
 		go inst.AcceptConnection()
+	}
+}
+
+func maintainLearnedRoutes(ttl time.Duration) {
+	flushTicker := time.NewTicker(30 * time.Second)
+	pruneTicker := time.NewTicker(time.Hour)
+	defer flushTicker.Stop()
+	defer pruneTicker.Stop()
+	for {
+		select {
+		case <-flushTicker.C:
+			if err := LearnedRoutes.Flush(); err != nil {
+				log.Printf("Error flushing learned domain usage: %v", err)
+			}
+		case <-pruneTicker.C:
+			removed, err := LearnedRoutes.PruneExpired(ttl, time.Now())
+			if err != nil {
+				log.Printf("Error pruning learned domains: %v", err)
+				continue
+			}
+			if removed > 0 {
+				log.Printf("Pruned %d expired learned domain routes", removed)
+			}
+			ProxyMetrics.SetLearnedRoutes(len(LearnedRoutes.Entries()))
+		}
 	}
 }

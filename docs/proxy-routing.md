@@ -15,6 +15,10 @@ proxy:
   address: "0.0.0.0"
   port: 1080
 
+admin:
+  address: "127.0.0.1"
+  port: 9090
+
 upstreams:
   vpn:
     address: "10.0.0.10:1080"
@@ -30,6 +34,7 @@ detection:
   probe-timeout: 5s
   fallback-upstream: vpn
   learned-domains-file: learned-domains.yml
+  learned-domain-ttl: 168h
 
 default:
   egress: direct
@@ -56,3 +61,17 @@ List entries are exact hosts (`www.example.com`) or domain suffixes (`.example.c
 The proxy starts the response timer only after forwarding a TLS ClientHello. If direct traffic is silent, one probe per hostname is allowed at a time. The probe performs a full upstream SOCKS5 CONNECT, replays only the ClientHello, and waits for the first target byte. On success, it atomically updates `learned-domains.yml` and closes the failed client connection. The browser is expected to retry.
 
 Events are logged as `event=block_candidate`, `event=fallback_success`, or a specific failure event. Learned hosts are exact matches and do not automatically expand to their parent domain.
+
+Usage counters and `last-used-at` are batched to the learned-domain file every 30 seconds. When `learned-domain-ttl` is non-zero, age is measured from `learned-at`; expiration deliberately forces a new direct attempt and fallback probe. Entries can also be deleted from the dashboard.
+
+## Admin dashboard and metrics
+
+Set `admin.port` to enable the local HTTP server. Keep it bound to `127.0.0.1`; it has no authentication. The endpoints are:
+
+- `/` — live dashboard with sessions, bytes, routing decisions, fallback outcomes, and learned domains.
+- `/api/status` — the dashboard data as JSON.
+- `/api/learned` — learned entries as JSON; `DELETE /api/learned?host=example.com` removes one.
+- `/metrics` — Prometheus metrics, including Go process metrics.
+- `/healthz` — lightweight process health check.
+
+Counters are process-lifetime values and restart from zero. Learned routes and their usage counters persist in YAML.
