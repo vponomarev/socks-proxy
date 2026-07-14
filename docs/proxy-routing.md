@@ -1,10 +1,12 @@
 # Proxy Routing MVP
 
-The proxy supports three routing decisions:
+The proxy supports three configured routing decisions and two automatic fallback paths:
 
 1. `direct`: connect to the destination without another proxy.
 2. Static `socks5`: domains from a configured list always use a named upstream.
-3. Learned fallback: a direct TLS connection that receives no response is probed through a fallback SOCKS5 upstream. A successful probe stores the exact hostname so subsequent browser retries use that upstream.
+3. Learned fallback: a previously learned exact hostname uses its recorded upstream.
+
+For a direct policy with fallback enabled, a failed TCP connect is immediately retried through the fallback SOCKS5 upstream. If that succeeds, the current browser connection continues transparently and the target is learned. When direct TCP connects but a TLS ClientHello receives no response, the proxy runs the existing parallel upstream probe, learns on success, closes the silent connection, and lets the browser retry.
 
 Static SOCKS5 policies take priority over learned entries. A direct policy can disable learning with `fallback: none`. Automatic probing is limited to a complete TLS ClientHello; arbitrary application requests are never replayed.
 
@@ -60,7 +62,7 @@ List entries are exact hosts (`www.example.com`) or domain suffixes (`.example.c
 
 The proxy starts the response timer only after forwarding a TLS ClientHello. If direct traffic is silent, one probe per hostname is allowed at a time. The probe performs a full upstream SOCKS5 CONNECT, replays only the ClientHello, and waits for the first target byte. On success, it atomically updates `learned-domains.yml` and closes the failed client connection. The browser is expected to retry.
 
-Events are logged as `event=block_candidate`, `event=fallback_success`, or a specific failure event. Learned hosts are exact matches and do not automatically expand to their parent domain.
+Events are logged as `event=direct_connect_failed`, `event=connect_fallback_success`, `event=block_candidate`, `event=fallback_success`, or a specific failure event. Learned hosts are exact matches and do not automatically expand to their parent domain.
 
 Usage counters and `last-used-at` are batched to the learned-domain file every 30 seconds. When `learned-domain-ttl` is non-zero, age is measured from `learned-at`; expiration deliberately forces a new direct attempt and fallback probe. Entries can also be deleted from the dashboard.
 
