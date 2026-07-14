@@ -10,11 +10,13 @@ import (
 	"log"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/vponomarev/socks-proxy/internal/config"
 	"github.com/vponomarev/socks-proxy/internal/libtls"
+	"github.com/vponomarev/socks-proxy/internal/routing"
 	"github.com/vponomarev/socks-proxy/internal/socksclient"
 	"github.com/vponomarev/socks-proxy/internal/upstream"
 )
@@ -29,27 +31,62 @@ var (
 
 type probeCoordinator struct {
 	mu     sync.Mutex
-	active map[string]struct{}
+	states map[string]probeState
 }
+
+type probeState struct {
+	active     bool
+	retryAfter time.Time
+}
+
+const maxProbeStates = 10000
 
 func newProbeCoordinator() *probeCoordinator {
-	return &probeCoordinator{active: make(map[string]struct{})}
+	return &probeCoordinator{states: make(map[string]probeState)}
 }
 
-func (p *probeCoordinator) Start(host string) bool {
+func (p *probeCoordinator) Start(host string, now time.Time) (bool, string) {
+	host = normalizeProbeHost(host)
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if _, exists := p.active[host]; exists {
-		return false
+	state, exists := p.states[host]
+	if exists && state.active {
+		return false, "already_in_progress"
 	}
-	p.active[host] = struct{}{}
-	return true
+	if exists && now.Before(state.retryAfter) {
+		return false, "failure_backoff"
+	}
+	if !exists && len(p.states) >= maxProbeStates {
+		p.pruneExpiredLocked(now)
+		if len(p.states) >= maxProbeStates {
+			return false, "coordinator_full"
+		}
+	}
+	p.states[host] = probeState{active: true}
+	return true, ""
 }
 
-func (p *probeCoordinator) Done(host string) {
+func (p *probeCoordinator) pruneExpiredLocked(now time.Time) {
+	for host, state := range p.states {
+		if !state.active && !now.Before(state.retryAfter) {
+			delete(p.states, host)
+		}
+	}
+}
+
+func (p *probeCoordinator) Done(host string, retryAfter time.Time) {
+	host = normalizeProbeHost(host)
 	p.mu.Lock()
-	delete(p.active, host)
+	if retryAfter.IsZero() {
+		delete(p.states, host)
+	} else {
+		p.states[host] = probeState{retryAfter: retryAfter}
+	}
 	p.mu.Unlock()
+}
+
+func normalizeProbeHost(host string) string {
+	return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
 }
 
 type Socks5 struct {
@@ -365,12 +402,28 @@ func (s *Socks5) connectAfterDirectFailure(host string, port uint16, directErr e
 	s.Policy.Upstream = upstreamName
 	added := false
 	if LearnedRoutes != nil {
-		var learnErr error
-		added, learnErr = LearnedRoutes.Add(host, upstreamName, "direct-connect-failure-upstream-success")
-		if learnErr != nil {
-			log.Printf("[%d] event=learned_domain_write_failed host=%s error=%v", s.UniqNo, host, learnErr)
+		cfg := s.sessionConfig()
+		allowed, skipReason := cfg.Detection.CanLearn(host)
+		if !allowed {
+			log.Printf("[%d] event=learned_domain_skipped host=%s reason=%s", s.UniqNo, host, skipReason)
 			if ProxyMetrics != nil {
-				ProxyMetrics.FallbackResult("learn_write_failed", upstreamName)
+				ProxyMetrics.FallbackResult("learn_skipped_"+skipReason, upstreamName)
+			}
+		} else {
+			var learnErr error
+			var evicted *routing.LearnedDomain
+			added, evicted, learnErr = LearnedRoutes.AddWithLimit(host, upstreamName, "direct-connect-failure-upstream-success", cfg.Detection.LearnedLimit())
+			if learnErr != nil {
+				log.Printf("[%d] event=learned_domain_write_failed host=%s error=%v", s.UniqNo, host, learnErr)
+				if ProxyMetrics != nil {
+					ProxyMetrics.FallbackResult("learn_write_failed", upstreamName)
+				}
+			}
+			if evicted != nil {
+				log.Printf("[%d] event=learned_domain_evicted host=%s replacement=%s", s.UniqNo, evicted.Host, host)
+				if ProxyMetrics != nil {
+					ProxyMetrics.FallbackResult("learn_evicted", upstreamName)
+				}
 			}
 		}
 	}
@@ -600,14 +653,22 @@ func (s *Socks5) monitorBlockCandidate(host string, clientHello []byte) {
 		return
 	case <-timer.C:
 	}
-	if !FallbackProbes.Start(host) {
-		log.Printf("[%d] event=fallback_probe_skipped reason=already_in_progress host=%s", s.UniqNo, host)
+	if allowed, reason := cfg.Detection.CanLearn(host); !allowed {
+		log.Printf("[%d] event=fallback_probe_skipped reason=%s host=%s", s.UniqNo, reason, host)
 		if ProxyMetrics != nil {
-			ProxyMetrics.FallbackResult("skipped_in_progress", s.Policy.Fallback)
+			ProxyMetrics.FallbackResult("skipped_"+reason, s.Policy.Fallback)
 		}
 		return
 	}
-	defer FallbackProbes.Done(host)
+	if started, reason := FallbackProbes.Start(host, time.Now()); !started {
+		log.Printf("[%d] event=fallback_probe_skipped reason=%s host=%s", s.UniqNo, reason, host)
+		if ProxyMetrics != nil {
+			ProxyMetrics.FallbackResult("skipped_"+reason, s.Policy.Fallback)
+		}
+		return
+	}
+	retryAfter := time.Now().Add(cfg.Detection.FailureBackoff())
+	defer func() { FallbackProbes.Done(host, retryAfter) }()
 
 	log.Printf("[%d] event=block_candidate host=%s target_ip=%s fallback=%s", s.UniqNo, host, s.ConnTargetIP, s.Policy.Fallback)
 	if ProxyMetrics != nil {
@@ -653,6 +714,7 @@ func (s *Socks5) monitorBlockCandidate(host string, clientHello []byte) {
 	}
 	select {
 	case <-s.firstResponse:
+		retryAfter = time.Time{}
 		log.Printf("[%d] event=fallback_ignored reason=direct_response_received host=%s", s.UniqNo, host)
 		if ProxyMetrics != nil {
 			ProxyMetrics.FallbackResult("direct_won", s.Policy.Fallback)
@@ -661,13 +723,20 @@ func (s *Socks5) monitorBlockCandidate(host string, clientHello []byte) {
 	default:
 	}
 
-	added, err := LearnedRoutes.Add(host, s.Policy.Fallback, "direct-timeout-upstream-success")
+	added, evicted, err := LearnedRoutes.AddWithLimit(host, s.Policy.Fallback, "direct-timeout-upstream-success", cfg.Detection.LearnedLimit())
 	if err != nil {
 		log.Printf("[%d] event=learned_domain_write_failed host=%s error=%v", s.UniqNo, host, err)
 		if ProxyMetrics != nil {
 			ProxyMetrics.FallbackResult("learn_write_failed", s.Policy.Fallback)
 		}
 		return
+	}
+	retryAfter = time.Time{}
+	if evicted != nil {
+		log.Printf("[%d] event=learned_domain_evicted host=%s replacement=%s", s.UniqNo, evicted.Host, host)
+		if ProxyMetrics != nil {
+			ProxyMetrics.FallbackResult("learn_evicted", s.Policy.Fallback)
+		}
 	}
 	log.Printf("[%d] event=fallback_success host=%s upstream=%s learned=%t", s.UniqNo, host, s.Policy.Fallback, added)
 	if ProxyMetrics != nil {

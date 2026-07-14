@@ -101,19 +101,36 @@ func (s *Store) MarkUsed(host string, now time.Time) bool {
 }
 
 func (s *Store) Add(host, upstream, reason string) (bool, error) {
+	added, _, err := s.AddWithLimit(host, upstream, reason, 0)
+	return added, err
+}
+
+// AddWithLimit adds or replaces an exact-host route. When a new entry would
+// exceed maxEntries, the least recently used route is evicted atomically with
+// the update. A non-positive limit disables eviction.
+func (s *Store) AddWithLimit(host, upstream, reason string, maxEntries int) (bool, *LearnedDomain, error) {
 	host = normalizeHost(host)
 	if host == "" {
-		return false, fmt.Errorf("learned domain host is empty")
+		return false, nil, fmt.Errorf("learned domain host is empty")
 	}
 	if upstream == "" {
-		return false, fmt.Errorf("learned domain upstream is empty")
+		return false, nil, fmt.Errorf("learned domain upstream is empty")
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	current, existed := s.domains[host]
 	if existed && current.Upstream == upstream {
-		return false, nil
+		return false, nil, nil
+	}
+	var evicted *LearnedDomain
+	if !existed && maxEntries > 0 && len(s.domains) >= maxEntries {
+		candidate := s.evictionCandidateLocked()
+		if candidate != nil {
+			entry := *candidate
+			evicted = &entry
+			delete(s.domains, entry.Host)
+		}
 	}
 	s.domains[host] = LearnedDomain{
 		Host:      host,
@@ -127,10 +144,42 @@ func (s *Store) Add(host, upstream, reason string) (bool, error) {
 		} else {
 			delete(s.domains, host)
 		}
-		return false, err
+		if evicted != nil {
+			s.domains[evicted.Host] = *evicted
+		}
+		return false, nil, err
 	}
 	s.dirty = false
-	return true, nil
+	return true, evicted, nil
+}
+
+func (s *Store) evictionCandidateLocked() *LearnedDomain {
+	var candidate *LearnedDomain
+	for _, entry := range s.domains {
+		entry := entry
+		if candidate == nil || lessRecentlyUsed(entry, *candidate) {
+			candidate = &entry
+		}
+	}
+	return candidate
+}
+
+func lessRecentlyUsed(left, right LearnedDomain) bool {
+	leftUsed := left.LastUsedAt
+	if leftUsed.IsZero() {
+		leftUsed = left.LearnedAt
+	}
+	rightUsed := right.LastUsedAt
+	if rightUsed.IsZero() {
+		rightUsed = right.LearnedAt
+	}
+	if !leftUsed.Equal(rightUsed) {
+		return leftUsed.Before(rightUsed)
+	}
+	if !left.LearnedAt.Equal(right.LearnedAt) {
+		return left.LearnedAt.Before(right.LearnedAt)
+	}
+	return left.Host < right.Host
 }
 
 func (s *Store) Delete(host string) (bool, error) {
@@ -162,6 +211,36 @@ func (s *Store) PruneExpired(ttl time.Duration, now time.Time) (int, error) {
 			removed[host] = entry
 			delete(s.domains, host)
 		}
+	}
+	if len(removed) == 0 {
+		return 0, nil
+	}
+	if err := s.saveLocked(); err != nil {
+		for host, entry := range removed {
+			s.domains[host] = entry
+		}
+		return 0, err
+	}
+	s.dirty = false
+	return len(removed), nil
+}
+
+// PruneToLimit enforces a lowered runtime limit on an existing store using
+// the same least-recently-used ordering as AddWithLimit.
+func (s *Store) PruneToLimit(maxEntries int) (int, error) {
+	if maxEntries <= 0 {
+		return 0, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	removed := make(map[string]LearnedDomain)
+	for len(s.domains) > maxEntries {
+		candidate := s.evictionCandidateLocked()
+		if candidate == nil {
+			break
+		}
+		removed[candidate.Host] = *candidate
+		delete(s.domains, candidate.Host)
 	}
 	if len(removed) == 0 {
 		return 0, nil

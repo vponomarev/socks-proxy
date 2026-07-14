@@ -50,11 +50,17 @@ func (u Upstream) Timeout() time.Duration {
 }
 
 type Detection struct {
-	FirstResponseTimeout string `yaml:"first-response-timeout"`
-	ProbeTimeout         string `yaml:"probe-timeout"`
-	FallbackUpstream     string `yaml:"fallback-upstream"`
-	LearnedDomainsFile   string `yaml:"learned-domains-file"`
-	LearnedDomainTTL     string `yaml:"learned-domain-ttl"`
+	FirstResponseTimeout string         `yaml:"first-response-timeout"`
+	ProbeTimeout         string         `yaml:"probe-timeout"`
+	ProbeFailureBackoff  string         `yaml:"probe-failure-backoff"`
+	FallbackUpstream     string         `yaml:"fallback-upstream"`
+	LearnedDomainsFile   string         `yaml:"learned-domains-file"`
+	LearnedDomainTTL     string         `yaml:"learned-domain-ttl"`
+	LearnedMaxEntries    int            `yaml:"learned-max-entries"`
+	LearnAllowList       string         `yaml:"learn-allow-list"`
+	LearnDenyList        string         `yaml:"learn-deny-list"`
+	LearnAllowRecords    []DomainRecord `yaml:"-"`
+	LearnDenyRecords     []DomainRecord `yaml:"-"`
 }
 
 func (d Detection) ResponseTimeout() time.Duration {
@@ -65,8 +71,31 @@ func (d Detection) FallbackProbeTimeout() time.Duration {
 	return parseDuration(d.ProbeTimeout, 5*time.Second)
 }
 
+func (d Detection) FailureBackoff() time.Duration {
+	return parseDuration(d.ProbeFailureBackoff, 5*time.Minute)
+}
+
 func (d Detection) LearnedTTL() time.Duration {
 	return parseDuration(d.LearnedDomainTTL, 0)
+}
+
+func (d Detection) LearnedLimit() int {
+	if d.LearnedMaxEntries == 0 {
+		return 10000
+	}
+	return d.LearnedMaxEntries
+}
+
+// CanLearn applies the optional automatic-learning filters. A deny match
+// always wins; when an allow list is configured, unmatched hosts are denied.
+func (d Detection) CanLearn(host string) (bool, string) {
+	if recordsMatch(d.LearnDenyRecords, host) {
+		return false, "deny_list"
+	}
+	if d.LearnAllowList != "" && !recordsMatch(d.LearnAllowRecords, host) {
+		return false, "not_in_allow_list"
+	}
+	return true, ""
 }
 
 type Admin struct {
@@ -167,6 +196,22 @@ func LoadConfig(path string) (config *Config, err error) {
 	} else if config.Detection.LearnedDomainsFile != "" && !filepath.IsAbs(config.Detection.LearnedDomainsFile) {
 		config.Detection.LearnedDomainsFile = filepath.Join(baseDir, config.Detection.LearnedDomainsFile)
 	}
+	for path, records := range map[*string]*[]DomainRecord{
+		&config.Detection.LearnAllowList: &config.Detection.LearnAllowRecords,
+		&config.Detection.LearnDenyList:  &config.Detection.LearnDenyRecords,
+	} {
+		if *path == "" {
+			continue
+		}
+		if !filepath.IsAbs(*path) {
+			*path = filepath.Join(baseDir, *path)
+		}
+		list := DomainList{}
+		if err := list.Load(*path); err != nil {
+			return nil, fmt.Errorf("load learning filter %q: %w", *path, err)
+		}
+		*records = list.Records
+	}
 
 	// Load all lists. Relative paths are resolved from the configuration file.
 	for i := range config.Strategy {
@@ -248,6 +293,18 @@ func (c *Config) Validate() error {
 		if _, err := time.ParseDuration(c.Detection.ProbeTimeout); err != nil {
 			return fmt.Errorf("detection probe-timeout: %w", err)
 		}
+	}
+	if c.Detection.ProbeFailureBackoff != "" {
+		backoff, err := time.ParseDuration(c.Detection.ProbeFailureBackoff)
+		if err != nil {
+			return fmt.Errorf("detection probe-failure-backoff: %w", err)
+		}
+		if backoff <= 0 {
+			return fmt.Errorf("detection probe-failure-backoff must be positive")
+		}
+	}
+	if c.Detection.LearnedMaxEntries < 0 {
+		return fmt.Errorf("detection learned-max-entries must not be negative")
 	}
 	if c.Detection.LearnedDomainTTL != "" {
 		ttl, err := time.ParseDuration(c.Detection.LearnedDomainTTL)
@@ -351,6 +408,16 @@ func (c *Config) PolicyFor(host string, learnedUpstream string) ResolvedPolicy {
 func (s Strategy) matches(host string) bool {
 	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
 	for _, record := range s.ListRecords {
+		if record.Regexp != nil && record.Regexp.MatchString(host) {
+			return true
+		}
+	}
+	return false
+}
+
+func recordsMatch(records []DomainRecord, host string) bool {
+	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	for _, record := range records {
 		if record.Regexp != nil && record.Regexp.MatchString(host) {
 			return true
 		}

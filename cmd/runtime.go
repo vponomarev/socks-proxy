@@ -81,6 +81,15 @@ func reloadRuntime(parent context.Context, path string) error {
 	if err := validateReload(current.config, next); err != nil {
 		return err
 	}
+	if LearnedRoutes != nil {
+		removed, err := LearnedRoutes.PruneToLimit(next.Detection.LearnedLimit())
+		if err != nil {
+			return fmt.Errorf("enforce learned domain limit: %w", err)
+		}
+		if removed > 0 && ProxyMetrics != nil {
+			ProxyMetrics.SetLearnedRoutes(len(LearnedRoutes.Entries()))
+		}
+	}
 	installRuntime(parent, next)
 	return nil
 }

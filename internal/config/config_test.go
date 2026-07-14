@@ -136,3 +136,37 @@ func TestRejectsInvalidUpstreamHealth(t *testing.T) {
 		t.Fatal("LoadConfig() accepted zero health-check interval")
 	}
 }
+
+func TestLearningFiltersLimitsAndBackoff(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "allow.txt"), []byte(".example.com\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "deny.txt"), []byte("private.example.com\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "proxy.yml")
+	data := []byte("detection:\n  probe-failure-backoff: 2m\n  learned-max-entries: 42\n  learn-allow-list: allow.txt\n  learn-deny-list: deny.txt\n")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Detection.FailureBackoff() != 2*time.Minute || cfg.Detection.LearnedLimit() != 42 {
+		t.Fatalf("learning settings = %v, %d", cfg.Detection.FailureBackoff(), cfg.Detection.LearnedLimit())
+	}
+	if allowed, _ := cfg.Detection.CanLearn("api.example.com"); !allowed {
+		t.Fatal("allowed suffix was rejected")
+	}
+	if allowed, reason := cfg.Detection.CanLearn("private.example.com"); allowed || reason != "deny_list" {
+		t.Fatalf("deny match = %v, %q", allowed, reason)
+	}
+	if allowed, reason := cfg.Detection.CanLearn("other.test"); allowed || reason != "not_in_allow_list" {
+		t.Fatalf("allow miss = %v, %q", allowed, reason)
+	}
+	if (Detection{}).LearnedLimit() != 10000 || (Detection{}).FailureBackoff() != 5*time.Minute {
+		t.Fatal("unexpected reliability defaults")
+	}
+}

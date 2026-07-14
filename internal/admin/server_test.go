@@ -33,6 +33,7 @@ func TestDashboardStatusMetricsAndDelete(t *testing.T) {
 		store,
 		func() *upstream.Manager { return upstreams },
 		func() time.Duration { return 24 * time.Hour },
+		func() int { return 100 },
 		func() error { reloadCalls++; return nil },
 	)
 
@@ -56,6 +57,23 @@ func TestDashboardStatusMetricsAndDelete(t *testing.T) {
 	handler.ServeHTTP(metricResponse, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	if !strings.Contains(metricResponse.Body.String(), "socks_proxy_sessions_started_total 1") {
 		t.Fatalf("metrics missing session counter: %s", metricResponse.Body.String())
+	}
+
+	added := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/api/learned", strings.NewReader(`{"host":"manual.example","upstream":"vpn"}`))
+	request.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(added, request)
+	if added.Code != http.StatusOK {
+		t.Fatalf("add learned = %d %q", added.Code, added.Body.String())
+	}
+	if entry, ok := store.Lookup("manual.example"); !ok || entry.Reason != "manual-api" {
+		t.Fatalf("manual route = %#v, %v", entry, ok)
+	}
+
+	unknown := httptest.NewRecorder()
+	handler.ServeHTTP(unknown, httptest.NewRequest(http.MethodPost, "/api/learned", strings.NewReader(`{"host":"bad.example","upstream":"missing"}`)))
+	if unknown.Code != http.StatusBadRequest {
+		t.Fatalf("unknown upstream = %d; want %d", unknown.Code, http.StatusBadRequest)
 	}
 
 	deleted := httptest.NewRecorder()

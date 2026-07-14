@@ -42,9 +42,13 @@ upstream-health:
 detection:
   first-response-timeout: 3s
   probe-timeout: 5s
+  probe-failure-backoff: 5m
   fallback-upstream: vpn
   learned-domains-file: learned-domains.yml
+  learned-max-entries: 10000
   learned-domain-ttl: 168h
+  # learn-allow-list: list/learn-allow.txt
+  # learn-deny-list: list/learn-deny.txt
 
 default:
   egress: direct
@@ -74,13 +78,15 @@ Events are logged as `event=direct_connect_failed`, `event=connect_fallback_succ
 
 Usage counters and `last-used-at` are batched to the learned-domain file every 30 seconds. When `learned-domain-ttl` is non-zero, age is measured from `learned-at`; expiration deliberately forces a new direct attempt and fallback probe. Entries can also be deleted from the dashboard.
 
+Failed probes are suppressed per hostname for `probe-failure-backoff`, preventing browser retries from creating an upstream probe storm. `learned-max-entries` bounds memory and file growth; a new route evicts the least recently used entry when the limit is reached. Optional allow and deny lists use the same exact/suffix syntax as strategy lists, with deny taking priority. Filters apply only to automatic learning, so an operator can still add an explicit route through the API.
+
 ## Admin dashboard and metrics
 
 Set `admin.port` to enable the local HTTP server. Keep it bound to `127.0.0.1`; it has no authentication. The endpoints are:
 
 - `/` — live dashboard with sessions, bytes, routing decisions, fallback outcomes, and learned domains.
 - `/api/status` — the dashboard data as JSON.
-- `/api/learned` — learned entries as JSON; `DELETE /api/learned?host=example.com` removes one.
+- `/api/learned` — learned entries as JSON; `DELETE /api/learned?host=example.com` removes one. `POST /api/learned` with `{"host":"example.com","upstream":"vpn"}` adds an operator-selected route.
 - `/api/upstreams` — current health and circuit-breaker state for every named upstream.
 - `POST /api/reload` — validate and atomically apply routing, upstream, detection, and timeout changes.
 - `/metrics` — Prometheus metrics, including Go process metrics.
