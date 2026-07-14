@@ -24,8 +24,13 @@ type Strategy struct {
 }
 
 type Proxy struct {
-	Address string `yaml:"address"`
-	Port    int    `yaml:"port"`
+	Address         string `yaml:"address"`
+	Port            int    `yaml:"port"`
+	ShutdownTimeout string `yaml:"shutdown-timeout"`
+}
+
+func (p Proxy) GracefulTimeout() time.Duration {
+	return parseDuration(p.ShutdownTimeout, 15*time.Second)
 }
 
 type FakeSni struct {
@@ -215,6 +220,15 @@ func (c *Config) normalizeStrategy(s *Strategy) {
 }
 
 func (c *Config) Validate() error {
+	if c.Proxy.ShutdownTimeout != "" {
+		timeout, err := time.ParseDuration(c.Proxy.ShutdownTimeout)
+		if err != nil {
+			return fmt.Errorf("proxy shutdown-timeout: %w", err)
+		}
+		if timeout <= 0 {
+			return fmt.Errorf("proxy shutdown-timeout must be positive")
+		}
+	}
 	for name, upstream := range c.Upstreams {
 		if strings.TrimSpace(upstream.Address) == "" {
 			return fmt.Errorf("upstream %q has no address", name)

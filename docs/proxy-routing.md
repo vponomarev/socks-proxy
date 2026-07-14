@@ -16,6 +16,7 @@ Static SOCKS5 policies take priority over learned entries. A direct policy can d
 proxy:
   address: "0.0.0.0"
   port: 1080
+  shutdown-timeout: 15s
 
 admin:
   address: "127.0.0.1"
@@ -81,10 +82,15 @@ Set `admin.port` to enable the local HTTP server. Keep it bound to `127.0.0.1`; 
 - `/api/status` — the dashboard data as JSON.
 - `/api/learned` — learned entries as JSON; `DELETE /api/learned?host=example.com` removes one.
 - `/api/upstreams` — current health and circuit-breaker state for every named upstream.
+- `POST /api/reload` — validate and atomically apply routing, upstream, detection, and timeout changes.
 - `/metrics` — Prometheus metrics, including Go process metrics.
 - `/healthz` — lightweight process health check.
 
 Counters are process-lifetime values and restart from zero. Learned routes and their usage counters persist in YAML.
+
+The dashboard's **Reload config** button calls the same endpoint. On Linux, `SIGHUP` also reloads the file. New SOCKS sessions use the new configuration; sessions already in progress keep their original snapshot. Changing the SOCKS or admin listener, capture interface, or learned-domain file still requires a restart.
+
+`SIGINT` and `SIGTERM` stop accepting new clients, shut down the admin server, wait up to `proxy.shutdown-timeout` for active sessions, and flush learned-domain usage before exit. Windows console shutdown supports `Ctrl+C`; use the admin endpoint for configuration reloads on Windows.
 
 ## Upstream health and circuit breaker
 
