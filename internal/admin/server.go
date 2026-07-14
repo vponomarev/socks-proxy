@@ -20,6 +20,7 @@ type API struct {
 	routes           *routing.Store
 	upstreamProvider func() *upstream.Manager
 	ttlProvider      func() time.Duration
+	limitProvider    func() int
 	reload           func() error
 }
 
@@ -34,8 +35,8 @@ type statusResponse struct {
 	Upstreams []upstream.State `json:"upstreams"`
 }
 
-func NewHandler(metrics *monitor.Monitor, routes *routing.Store, upstreamProvider func() *upstream.Manager, ttlProvider func() time.Duration, reload func() error) http.Handler {
-	api := &API{metrics: metrics, routes: routes, upstreamProvider: upstreamProvider, ttlProvider: ttlProvider, reload: reload}
+func NewHandler(metrics *monitor.Monitor, routes *routing.Store, upstreamProvider func() *upstream.Manager, ttlProvider func() time.Duration, limitProvider func() int, reload func() error) http.Handler {
+	api := &API{metrics: metrics, routes: routes, upstreamProvider: upstreamProvider, ttlProvider: ttlProvider, limitProvider: limitProvider, reload: reload}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", api.dashboard)
 	mux.HandleFunc("/healthz", api.health)
@@ -47,7 +48,7 @@ func NewHandler(metrics *monitor.Monitor, routes *routing.Store, upstreamProvide
 	return mux
 }
 
-func Start(cfg config.Admin, metrics *monitor.Monitor, routes *routing.Store, upstreamProvider func() *upstream.Manager, ttlProvider func() time.Duration, reload func() error) (*http.Server, error) {
+func Start(cfg config.Admin, metrics *monitor.Monitor, routes *routing.Store, upstreamProvider func() *upstream.Manager, ttlProvider func() time.Duration, limitProvider func() int, reload func() error) (*http.Server, error) {
 	address := net.JoinHostPort(cfg.Address, fmt.Sprintf("%d", cfg.Port))
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
@@ -55,7 +56,7 @@ func Start(cfg config.Admin, metrics *monitor.Monitor, routes *routing.Store, up
 	}
 	server := &http.Server{
 		Addr:              address,
-		Handler:           NewHandler(metrics, routes, upstreamProvider, ttlProvider, reload),
+		Handler:           NewHandler(metrics, routes, upstreamProvider, ttlProvider, limitProvider, reload),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
@@ -130,20 +131,26 @@ func (a *API) upstreamStates(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *API) upstreamViews() []upstream.State {
-	if a.upstreamProvider == nil {
-		return []upstream.State{}
-	}
-	manager := a.upstreamProvider()
+	manager := a.currentUpstreams()
 	if manager == nil {
 		return []upstream.State{}
 	}
 	return manager.States()
 }
 
+func (a *API) currentUpstreams() *upstream.Manager {
+	if a.upstreamProvider == nil {
+		return nil
+	}
+	return a.upstreamProvider()
+}
+
 func (a *API) learned(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, a.views())
+	case http.MethodPost:
+		a.addLearned(w, r)
 	case http.MethodDelete:
 		host := r.URL.Query().Get("host")
 		if host == "" {
@@ -162,9 +169,47 @@ func (a *API) learned(w http.ResponseWriter, r *http.Request) {
 		a.metrics.SetLearnedRoutes(len(a.routes.Entries()))
 		writeJSON(w, http.StatusOK, map[string]any{"deleted": true, "host": host})
 	default:
-		w.Header().Set("Allow", "GET, DELETE")
+		w.Header().Set("Allow", "GET, POST, DELETE")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+func (a *API) addLearned(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		Host     string `json:"host"`
+		Upstream string `json:"upstream"`
+		Reason   string `json:"reason"`
+	}
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		http.Error(w, "invalid JSON body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	manager := a.currentUpstreams()
+	if manager == nil {
+		http.Error(w, "upstream manager is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	if _, exists := manager.State(request.Upstream); !exists {
+		http.Error(w, "unknown upstream", http.StatusBadRequest)
+		return
+	}
+	reason := request.Reason
+	if reason == "" {
+		reason = "manual-api"
+	}
+	limit := 0
+	if a.limitProvider != nil {
+		limit = a.limitProvider()
+	}
+	added, evicted, err := a.routes.AddWithLimit(request.Host, request.Upstream, reason, limit)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	a.metrics.SetLearnedRoutes(len(a.routes.Entries()))
+	writeJSON(w, http.StatusOK, map[string]any{"added": added, "host": request.Host, "evicted": evicted})
 }
 
 func (a *API) views() []learnedView {

@@ -29,11 +29,18 @@ upstream-health:
 detection:
   first-response-timeout: 3s
   probe-timeout: 5s
+  # Avoid retry storms when the fallback itself cannot reach a host.
+  probe-failure-backoff: 5m
   fallback-upstream: vpn
   learned-domains-file: learned-domains.yml
+  # Bounds memory and YAML growth; least-recently-used entries are evicted.
+  learned-max-entries: 10000
   # Expired entries are removed and may be learned again, revalidating direct.
   # Omit or set to 0s to keep learned entries indefinitely.
   learned-domain-ttl: 168h
+  # Optional automatic-learning filters; deny wins over allow.
+  # learn-allow-list: example-lists/learn-allow.txt
+  # learn-deny-list: example-lists/learn-deny.txt
 
 default:
   egress: direct

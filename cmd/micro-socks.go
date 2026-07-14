@@ -77,6 +77,11 @@ func main() {
 	} else if removed > 0 {
 		log.Printf("Pruned %d expired learned domain routes", removed)
 	}
+	if removed, limitErr := LearnedRoutes.PruneToLimit(Cfg.Detection.LearnedLimit()); limitErr != nil {
+		log.Fatalf("Error enforcing learned domain limit: %v", limitErr)
+	} else if removed > 0 {
+		log.Printf("Evicted %d learned domain routes above configured limit", removed)
+	}
 	ProxyMetrics = monitor.New()
 	ProxyMetrics.SetLearnedRoutes(len(LearnedRoutes.Entries()))
 	runtime := installRuntime(appCtx, Cfg)
@@ -88,6 +93,7 @@ func main() {
 	if Cfg.Admin.Enabled() {
 		upstreamProvider := func() *upstream.Manager { return currentRuntime().upstreams }
 		ttlProvider := func() time.Duration { return currentRuntime().config.Detection.LearnedTTL() }
+		limitProvider := func() int { return currentRuntime().config.Detection.LearnedLimit() }
 		reload := func() error {
 			if err := reloadRuntime(appCtx, *configPath); err != nil {
 				return err
@@ -95,7 +101,7 @@ func main() {
 			log.Printf("Configuration reloaded from %s", *configPath)
 			return nil
 		}
-		adminServer, err = admin.Start(Cfg.Admin, ProxyMetrics, LearnedRoutes, upstreamProvider, ttlProvider, reload)
+		adminServer, err = admin.Start(Cfg.Admin, ProxyMetrics, LearnedRoutes, upstreamProvider, ttlProvider, limitProvider, reload)
 		if err != nil {
 			log.Fatalf("Failed to start admin server: %v", err)
 		}

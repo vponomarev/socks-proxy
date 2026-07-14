@@ -151,6 +151,35 @@ func TestProxyDirectConnectFailureFallsBackAndLearns(t *testing.T) {
 	}
 }
 
+func TestProxyDirectConnectFallbackHonorsLearningDenyList(t *testing.T) {
+	upstreamAddress, _, stopUpstream := startEchoSOCKS5(t)
+	defer stopUpstream()
+	cfg := &config.Config{
+		Upstreams: map[string]config.Upstream{"vpn": {Address: upstreamAddress, ConnectTimeout: "1s"}},
+		Detection: config.Detection{
+			FallbackUpstream: "vpn",
+			LearnDenyRecords: []config.DomainRecord{{Regexp: regexp.MustCompile(`^denied\.example$`)}},
+		},
+		Default: config.DefaultPolicy{Egress: "direct", DPI: "none", Fallback: "vpn"},
+	}
+	store, err := routing.Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	setProxyTestGlobalsWithStore(t, cfg, store)
+	forceDirectDialFailure(t)
+	client, wait := startProxySession(t)
+	defer wait()
+
+	proxyGreeting(t, client)
+	proxyConnect(t, client, "denied.example", 443)
+	assertEcho(t, client, []byte("deny-list fallback payload"))
+	client.Close()
+	if _, ok := store.Lookup("denied.example"); ok {
+		t.Fatal("deny-listed fallback target was learned")
+	}
+}
+
 func TestProxyDirectAndFallbackConnectFailureReturnsError(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

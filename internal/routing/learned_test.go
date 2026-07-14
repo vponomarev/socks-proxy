@@ -106,3 +106,46 @@ func TestStoreDeduplicates(t *testing.T) {
 		t.Fatalf("second Add() = %v, %v; want false, nil", added, err)
 	}
 }
+
+func TestStoreEvictsLeastRecentlyUsedAtLimit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "learned.yml")
+	store, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if added, _, err := store.AddWithLimit("old.example", "vpn", "test", 2); err != nil || !added {
+		t.Fatalf("add old = %v, %v", added, err)
+	}
+	if added, _, err := store.AddWithLimit("used.example", "vpn", "test", 2); err != nil || !added {
+		t.Fatalf("add used = %v, %v", added, err)
+	}
+	store.MarkUsed("used.example", time.Now().Add(time.Hour))
+
+	added, evicted, err := store.AddWithLimit("new.example", "vpn", "test", 2)
+	if err != nil || !added {
+		t.Fatalf("add new = %v, %v", added, err)
+	}
+	if evicted == nil || evicted.Host != "old.example" {
+		t.Fatalf("evicted = %#v; want old.example", evicted)
+	}
+	if len(store.Entries()) != 2 {
+		t.Fatalf("entries = %d; want 2", len(store.Entries()))
+	}
+	if _, ok := store.Lookup("used.example"); !ok {
+		t.Fatal("recently used route was evicted")
+	}
+	reloaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := reloaded.Lookup("new.example"); !ok {
+		t.Fatal("replacement route was not persisted")
+	}
+	removed, err := reloaded.PruneToLimit(1)
+	if err != nil || removed != 1 {
+		t.Fatalf("PruneToLimit() = %d, %v", removed, err)
+	}
+	if _, ok := reloaded.Lookup("used.example"); !ok {
+		t.Fatal("PruneToLimit evicted the most recently used route")
+	}
+}

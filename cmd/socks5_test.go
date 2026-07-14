@@ -4,10 +4,30 @@ import (
 	"io"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/vponomarev/socks-proxy/internal/config"
 	"github.com/vponomarev/socks-proxy/internal/routing"
 )
+
+func TestProbeCoordinatorBackoff(t *testing.T) {
+	coordinator := newProbeCoordinator()
+	now := time.Now()
+	if started, reason := coordinator.Start("example.com", now); !started || reason != "" {
+		t.Fatalf("first start = %v, %q", started, reason)
+	}
+	if started, reason := coordinator.Start("EXAMPLE.COM.", now); started || reason != "already_in_progress" {
+		t.Fatalf("concurrent start = %v, %q", started, reason)
+	}
+	coordinator.Done("example.com", now.Add(time.Minute))
+	if started, reason := coordinator.Start("example.com", now.Add(30*time.Second)); started || reason != "failure_backoff" {
+		t.Fatalf("backoff start = %v, %q", started, reason)
+	}
+	if started, reason := coordinator.Start("example.com", now.Add(2*time.Minute)); !started || reason != "" {
+		t.Fatalf("post-backoff start = %v, %q", started, reason)
+	}
+	coordinator.Done("example.com", time.Time{})
+}
 
 func TestBlockCandidateLearnsSuccessfulFallback(t *testing.T) {
 	address, stop := startTestSOCKS5(t, []byte("client hello"))
