@@ -2,10 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"sync"
 	"time"
 
 	"github.com/google/gopacket"
@@ -37,6 +42,7 @@ var (
 	LearnedRoutes   *routing.Store
 	ProxyMetrics    *monitor.Monitor
 	UpstreamManager *upstream.Manager
+	SessionWG       sync.WaitGroup
 )
 
 func CaptureSessionInfo(conn net.Conn) (ok bool, si SessionInfo) {
@@ -54,6 +60,7 @@ func CaptureSessionInfo(conn net.Conn) (ok bool, si SessionInfo) {
 
 func main() {
 	flag.Parse()
+	appCtx, appCancel := context.WithCancel(context.Background())
 
 	var err error
 	Cfg, err = config.LoadConfig(*configPath)
@@ -72,25 +79,31 @@ func main() {
 	}
 	ProxyMetrics = monitor.New()
 	ProxyMetrics.SetLearnedRoutes(len(LearnedRoutes.Entries()))
-	UpstreamManager = upstream.New(Cfg.Upstreams, Cfg.UpstreamHealth)
-	for _, state := range UpstreamManager.States() {
-		ProxyMetrics.SetUpstreamState(state.Name, state.Health, state.Circuit)
-	}
-	if UpstreamManager.Enabled() {
-		go monitorUpstreamHealth(context.Background())
-	}
+	runtime := installRuntime(appCtx, Cfg)
+	UpstreamManager = runtime.upstreams
 	log.Printf("Loaded %d learned domain routes", len(LearnedRoutes.Entries()))
-	go maintainLearnedRoutes(ttl)
+	go maintainLearnedRoutes(appCtx)
 
+	var adminServer *http.Server
 	if Cfg.Admin.Enabled() {
-		if _, err := admin.Start(Cfg.Admin, ProxyMetrics, LearnedRoutes, UpstreamManager, ttl); err != nil {
+		upstreamProvider := func() *upstream.Manager { return currentRuntime().upstreams }
+		ttlProvider := func() time.Duration { return currentRuntime().config.Detection.LearnedTTL() }
+		reload := func() error {
+			if err := reloadRuntime(appCtx, *configPath); err != nil {
+				return err
+			}
+			log.Printf("Configuration reloaded from %s", *configPath)
+			return nil
+		}
+		adminServer, err = admin.Start(Cfg.Admin, ProxyMetrics, LearnedRoutes, upstreamProvider, ttlProvider, reload)
+		if err != nil {
 			log.Fatalf("Failed to start admin server: %v", err)
 		}
 		log.Printf("Admin dashboard started on http://%s:%d/", Cfg.Admin.Address, Cfg.Admin.Port)
 	}
 
 	if Cfg.FakeSni.Interface != "" {
-		okCapture, err, chCapture := setupCapture(context.Background(), Cfg.FakeSni.Interface)
+		okCapture, err, chCapture := setupCapture(appCtx, Cfg.FakeSni.Interface)
 		if okCapture {
 			go TrackSessions(chCapture)
 		}
@@ -109,10 +122,29 @@ func main() {
 	log.Printf("SOCKS5 proxy started on %v", portStr)
 	//log.Printf("Fragmentation: first %d bytes in %d-byte chunks", initialFragSize, fragmentSize)
 
+	shutdownCh := make(chan os.Signal, 1)
+	signal.Notify(shutdownCh, shutdownSignals()...)
+	defer signal.Stop(shutdownCh)
+	shuttingDown := make(chan struct{})
+	go func() {
+		sig := <-shutdownCh
+		log.Printf("Shutdown signal received: %v", sig)
+		close(shuttingDown)
+		_ = listener.Close()
+	}()
+	go watchReloadSignals(appCtx)
+
 	var CntNo uint32 = 1
-	for {
+	accepting := true
+	for accepting {
 		conn, err := listener.Accept()
 		if err != nil {
+			select {
+			case <-shuttingDown:
+				accepting = false
+				continue
+			default:
+			}
 			log.Printf("[%d] AcceptConnection error: %v", CntNo, err)
 			continue
 		}
@@ -122,15 +154,21 @@ func main() {
 			clientConn:    conn,
 			UniqNo:        CntNo,
 			firstResponse: make(chan struct{}),
+			runtime:       currentRuntime(),
 		}
 		CntNo++
-		go inst.AcceptConnection()
+		SessionWG.Add(1)
+		go func() {
+			defer SessionWG.Done()
+			inst.AcceptConnection()
+		}()
 	}
+	gracefulShutdown(appCancel, adminServer)
 }
 
-func monitorUpstreamHealth(ctx context.Context) {
+func monitorUpstreamHealth(ctx context.Context, runtime *proxyRuntime) {
 	check := func() {
-		for _, state := range UpstreamManager.CheckAll(ctx) {
+		for _, state := range runtime.upstreams.CheckAll(ctx) {
 			ProxyMetrics.SetUpstreamState(state.Name, state.Health, state.Circuit)
 			result := "health_check_success"
 			if state.Health != "healthy" {
@@ -141,7 +179,7 @@ func monitorUpstreamHealth(ctx context.Context) {
 		}
 	}
 	check()
-	ticker := time.NewTicker(Cfg.UpstreamHealth.CheckInterval())
+	ticker := time.NewTicker(runtime.config.UpstreamHealth.CheckInterval())
 	defer ticker.Stop()
 	for {
 		select {
@@ -153,18 +191,21 @@ func monitorUpstreamHealth(ctx context.Context) {
 	}
 }
 
-func maintainLearnedRoutes(ttl time.Duration) {
+func maintainLearnedRoutes(ctx context.Context) {
 	flushTicker := time.NewTicker(30 * time.Second)
 	pruneTicker := time.NewTicker(time.Hour)
 	defer flushTicker.Stop()
 	defer pruneTicker.Stop()
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case <-flushTicker.C:
 			if err := LearnedRoutes.Flush(); err != nil {
 				log.Printf("Error flushing learned domain usage: %v", err)
 			}
 		case <-pruneTicker.C:
+			ttl := currentRuntime().config.Detection.LearnedTTL()
 			removed, err := LearnedRoutes.PruneExpired(ttl, time.Now())
 			if err != nil {
 				log.Printf("Error pruning learned domains: %v", err)
@@ -175,5 +216,63 @@ func maintainLearnedRoutes(ttl time.Duration) {
 			}
 			ProxyMetrics.SetLearnedRoutes(len(LearnedRoutes.Entries()))
 		}
+	}
+}
+
+func watchReloadSignals(ctx context.Context) {
+	signals := reloadSignals()
+	if len(signals) == 0 {
+		return
+	}
+	reloadCh := make(chan os.Signal, 1)
+	signal.Notify(reloadCh, signals...)
+	defer signal.Stop(reloadCh)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case sig := <-reloadCh:
+			if err := reloadRuntime(ctx, *configPath); err != nil {
+				log.Printf("Configuration reload failed after %v: %v", sig, err)
+			} else {
+				log.Printf("Configuration reloaded from %s after %v", *configPath, sig)
+			}
+		}
+	}
+}
+
+func gracefulShutdown(cancel context.CancelFunc, adminServer *http.Server) {
+	timeout := currentRuntime().config.Proxy.GracefulTimeout()
+	ctx, stop := context.WithTimeout(context.Background(), timeout)
+	defer stop()
+	cancel()
+	stopRuntimeHealth()
+
+	if adminServer != nil {
+		if err := adminServer.Shutdown(ctx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+			log.Printf("Admin shutdown error: %v", err)
+		}
+	}
+	if waitForWaitGroup(ctx, &SessionWG) {
+		log.Printf("All active proxy sessions completed")
+	} else {
+		log.Printf("Graceful shutdown timeout reached with active sessions")
+	}
+	if err := LearnedRoutes.Flush(); err != nil {
+		log.Printf("Final learned-domain flush failed: %v", err)
+	}
+}
+
+func waitForWaitGroup(ctx context.Context, wg *sync.WaitGroup) bool {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-ctx.Done():
+		return false
 	}
 }

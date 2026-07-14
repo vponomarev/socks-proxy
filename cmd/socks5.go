@@ -72,6 +72,7 @@ type Socks5 struct {
 	Policy        config.ResolvedPolicy
 	firstResponse chan struct{}
 	responseOnce  sync.Once
+	runtime       *proxyRuntime
 	sync.RWMutex
 }
 
@@ -175,6 +176,7 @@ func (s *Socks5) AuthRequest() error {
 }
 
 func (s *Socks5) ProcessRequest() error {
+	cfg := s.sessionConfig()
 	request := make([]byte, 4)
 	if _, err := io.ReadFull(s.clientConn, request); err != nil {
 		return err
@@ -238,17 +240,17 @@ func (s *Socks5) ProcessRequest() error {
 	// Устанавливаем соединение с целевым сервером
 	learnedUpstream := ""
 	if LearnedRoutes != nil {
-		if learned, ok := LearnedRoutes.LookupActive(s.TargetHost, Cfg.Detection.LearnedTTL(), time.Now()); ok {
+		if learned, ok := LearnedRoutes.LookupActive(s.TargetHost, cfg.Detection.LearnedTTL(), time.Now()); ok {
 			learnedUpstream = learned.Upstream
 		}
 	}
-	s.Policy = Cfg.PolicyFor(s.TargetHost, learnedUpstream)
+	s.Policy = cfg.PolicyFor(s.TargetHost, learnedUpstream)
 
 	var targetConn net.Conn
 	var err error
 	dialStarted := time.Now()
 	if s.Policy.Egress == "socks5" {
-		targetConn, err = dialUpstream(s.Policy.Upstream, host, port)
+		targetConn, err = s.dialUpstream(s.Policy.Upstream, host, port)
 	} else {
 		targetAddr := net.JoinHostPort(host, strconv.Itoa(int(port)))
 		targetConn, err = directDial("tcp", targetAddr, 10*time.Second)
@@ -297,25 +299,30 @@ func (s *Socks5) ProcessRequest() error {
 	return nil
 }
 
-func dialUpstream(name, host string, port uint16) (net.Conn, error) {
-	cfgUpstream, ok := Cfg.Upstreams[name]
+func (s *Socks5) dialUpstream(name, host string, port uint16) (net.Conn, error) {
+	return s.dialUpstreamContext(context.Background(), name, host, port)
+}
+
+func (s *Socks5) dialUpstreamContext(parent context.Context, name, host string, port uint16) (net.Conn, error) {
+	runtime := s.runtimeSnapshot()
+	cfgUpstream, ok := runtime.config.Upstreams[name]
 	if !ok {
 		return nil, fmt.Errorf("unknown SOCKS5 upstream %q", name)
 	}
-	if UpstreamManager != nil && !UpstreamManager.Allow(name) {
+	if runtime.upstreams != nil && !runtime.upstreams.Allow(name) {
 		if ProxyMetrics != nil {
 			ProxyMetrics.UpstreamResult(name, "circuit_rejected")
-			if state, exists := UpstreamManager.State(name); exists {
+			if state, exists := runtime.upstreams.State(name); exists {
 				ProxyMetrics.SetUpstreamState(name, state.Health, state.Circuit)
 			}
 		}
 		return nil, fmt.Errorf("upstream %s: %w", name, upstream.ErrCircuitOpen)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), cfgUpstream.Timeout())
+	ctx, cancel := context.WithTimeout(parent, cfgUpstream.Timeout())
 	defer cancel()
 	conn, err := socksclient.Dial(ctx, cfgUpstream, host, port)
-	if UpstreamManager != nil {
-		state := UpstreamManager.Record(name, err)
+	if runtime.upstreams != nil {
+		state := runtime.upstreams.Record(name, err)
 		if ProxyMetrics != nil {
 			result := "dial_success"
 			if err != nil {
@@ -336,7 +343,7 @@ func (s *Socks5) connectAfterDirectFailure(host string, port uint16, directErr e
 	}
 
 	started := time.Now()
-	conn, fallbackErr := dialUpstream(upstreamName, host, port)
+	conn, fallbackErr := s.dialUpstream(upstreamName, host, port)
 	if ProxyMetrics != nil {
 		result := "success"
 		if fallbackErr != nil {
@@ -438,7 +445,7 @@ func (s *Socks5) StreamReverse() {
 func (s *Socks5) DoInject(data []byte) {
 	// Inject fake packets
 	// if (s.TargetHost == "i.ytimg.com" || (s.TargetHost == "vpnc.ru")) && s.TargetPort == 443 {
-	ok, rName := Cfg.IsFakeStrategy(s.TargetHost)
+	ok, rName := s.sessionConfig().IsFakeStrategy(s.TargetHost)
 	if ok && s.TargetPort == 443 {
 		time.Sleep(30 * time.Millisecond)
 		if ok, si := CaptureSessionInfo(s.targetConn); ok {
@@ -569,7 +576,7 @@ func (s *Socks5) injectFakePacket(tlsRecord *libtls.TLSRecord) {
 		log.Printf("[%d] event=fake_sni_session_not_found", s.UniqNo)
 		return
 	}
-	ttl := Cfg.FakeSni.Ttl
+	ttl := s.sessionConfig().FakeSni.Ttl
 	if ttl == 0 {
 		ttl = *paramTTL
 	}
@@ -585,7 +592,8 @@ func (s *Socks5) injectFakePacket(tlsRecord *libtls.TLSRecord) {
 }
 
 func (s *Socks5) monitorBlockCandidate(host string, clientHello []byte) {
-	timer := time.NewTimer(Cfg.Detection.ResponseTimeout())
+	cfg := s.sessionConfig()
+	timer := time.NewTimer(cfg.Detection.ResponseTimeout())
 	defer timer.Stop()
 	select {
 	case <-s.firstResponse:
@@ -605,7 +613,7 @@ func (s *Socks5) monitorBlockCandidate(host string, clientHello []byte) {
 	if ProxyMetrics != nil {
 		ProxyMetrics.FallbackResult("block_candidate", s.Policy.Fallback)
 	}
-	upstream, ok := Cfg.Upstreams[s.Policy.Fallback]
+	_, ok := cfg.Upstreams[s.Policy.Fallback]
 	if !ok {
 		log.Printf("[%d] event=fallback_configuration_error upstream=%s", s.UniqNo, s.Policy.Fallback)
 		if ProxyMetrics != nil {
@@ -613,10 +621,10 @@ func (s *Socks5) monitorBlockCandidate(host string, clientHello []byte) {
 		}
 		return
 	}
-	probeTimeout := Cfg.Detection.FallbackProbeTimeout()
+	probeTimeout := cfg.Detection.FallbackProbeTimeout()
 	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 	defer cancel()
-	probeConn, err := socksclient.Dial(ctx, upstream, s.TargetHost, s.TargetPort)
+	probeConn, err := s.dialUpstreamContext(ctx, s.Policy.Fallback, s.TargetHost, s.TargetPort)
 	if err != nil {
 		log.Printf("[%d] event=fallback_connect_failed host=%s upstream=%s error=%v", s.UniqNo, host, s.Policy.Fallback, err)
 		if ProxyMetrics != nil {

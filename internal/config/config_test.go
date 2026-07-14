@@ -72,6 +72,7 @@ func TestAdminDefaultsAndLearnedTTL(t *testing.T) {
 	data := []byte(`
 proxy:
   port: 1080
+  shutdown-timeout: 20s
 admin:
   port: 9090
 detection:
@@ -89,6 +90,22 @@ detection:
 	}
 	if cfg.Detection.LearnedTTL().Hours() != 168 {
 		t.Fatalf("learned TTL = %v", cfg.Detection.LearnedTTL())
+	}
+	if cfg.Proxy.GracefulTimeout() != 20*time.Second {
+		t.Fatalf("shutdown timeout = %v", cfg.Proxy.GracefulTimeout())
+	}
+}
+
+func TestProxyShutdownTimeoutDefaultsAndValidation(t *testing.T) {
+	if got := (Proxy{}).GracefulTimeout(); got != 15*time.Second {
+		t.Fatalf("default shutdown timeout = %v", got)
+	}
+	path := filepath.Join(t.TempDir(), "proxy.yml")
+	if err := os.WriteFile(path, []byte("proxy:\n  shutdown-timeout: 0s\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(path); err == nil {
+		t.Fatal("LoadConfig() accepted non-positive shutdown-timeout")
 	}
 }
 

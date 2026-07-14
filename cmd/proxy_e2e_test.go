@@ -192,7 +192,7 @@ func TestDialUpstreamRejectsOpenCircuit(t *testing.T) {
 		Enabled: true, FailureThreshold: 1, Cooldown: "1h",
 	})
 	UpstreamManager.Record("vpn", errors.New("offline"))
-	if _, err := dialUpstream("vpn", "example.com", 443); !errors.Is(err, upstream.ErrCircuitOpen) {
+	if _, err := (&Socks5{}).dialUpstream("vpn", "example.com", 443); !errors.Is(err, upstream.ErrCircuitOpen) {
 		t.Fatalf("dialUpstream() error = %v; want ErrCircuitOpen", err)
 	}
 }

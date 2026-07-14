@@ -27,7 +27,14 @@ func TestDashboardStatusMetricsAndDelete(t *testing.T) {
 	metrics.SessionStarted()
 	metrics.SessionFinished(12, 34, time.Second, "direct", "completed")
 	upstreams := upstream.New(map[string]config.Upstream{"vpn": {Address: "vpn:1080"}}, config.UpstreamHealth{})
-	handler := NewHandler(metrics, store, upstreams, 24*time.Hour)
+	reloadCalls := 0
+	handler := NewHandler(
+		metrics,
+		store,
+		func() *upstream.Manager { return upstreams },
+		func() time.Duration { return 24 * time.Hour },
+		func() error { reloadCalls++; return nil },
+	)
 
 	dashboard := httptest.NewRecorder()
 	handler.ServeHTTP(dashboard, httptest.NewRequest(http.MethodGet, "/", nil))
@@ -58,5 +65,17 @@ func TestDashboardStatusMetricsAndDelete(t *testing.T) {
 	}
 	if _, ok := store.Lookup("blocked.example"); ok {
 		t.Fatal("route still exists after API delete")
+	}
+
+	reloaded := httptest.NewRecorder()
+	handler.ServeHTTP(reloaded, httptest.NewRequest(http.MethodPost, "/api/reload", nil))
+	if reloaded.Code != http.StatusOK || reloadCalls != 1 {
+		t.Fatalf("reload = %d calls=%d body=%q", reloaded.Code, reloadCalls, reloaded.Body.String())
+	}
+
+	invalidReload := httptest.NewRecorder()
+	handler.ServeHTTP(invalidReload, httptest.NewRequest(http.MethodGet, "/api/reload", nil))
+	if invalidReload.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET reload = %d; want %d", invalidReload.Code, http.StatusMethodNotAllowed)
 	}
 }
