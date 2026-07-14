@@ -1,0 +1,10 @@
+# Bind this address to the VPN/tunnel interface. Do not expose this unauthenticated
+# SOCKS5 listener to the public Internet.
+proxy:
+  address: "127.0.0.1"
+  port: 1080
+
+default:
+  egress: direct
+  dpi: none
+  fallback: none

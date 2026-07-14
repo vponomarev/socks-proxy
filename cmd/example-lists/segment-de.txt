@@ -1,0 +1,3 @@
+# Add exact hosts or domain suffixes routed through the segment-de upstream.
+# example.org
+# .example.net

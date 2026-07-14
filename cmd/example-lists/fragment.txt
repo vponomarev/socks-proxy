@@ -1,0 +1,2 @@
+# Add exact hosts or domain suffixes tested with TLS fragmentation.
+# example.org
