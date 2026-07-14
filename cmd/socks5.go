@@ -20,6 +20,9 @@ import (
 var (
 	ReplaceCounter NumReplaced
 	FallbackProbes = newProbeCoordinator()
+	directDial     = func(network, address string, timeout time.Duration) (net.Conn, error) {
+		return (&net.Dialer{Timeout: timeout}).Dial(network, address)
+	}
 )
 
 type probeCoordinator struct {
@@ -240,13 +243,10 @@ func (s *Socks5) ProcessRequest() error {
 	var err error
 	dialStarted := time.Now()
 	if s.Policy.Egress == "socks5" {
-		upstream := Cfg.Upstreams[s.Policy.Upstream]
-		ctx, cancel := context.WithTimeout(context.Background(), upstream.Timeout())
-		targetConn, err = socksclient.Dial(ctx, upstream, host, port)
-		cancel()
+		targetConn, err = dialUpstream(s.Policy.Upstream, host, port)
 	} else {
 		targetAddr := net.JoinHostPort(host, strconv.Itoa(int(port)))
-		targetConn, err = (&net.Dialer{Timeout: 10 * time.Second}).Dial("tcp", targetAddr)
+		targetConn, err = directDial("tcp", targetAddr, 10*time.Second)
 	}
 	if ProxyMetrics != nil {
 		result := "success"
@@ -254,6 +254,9 @@ func (s *Socks5) ProcessRequest() error {
 			result = "failure"
 		}
 		ProxyMetrics.ObserveDial(s.Policy.Egress, s.Policy.Upstream, result, time.Since(dialStarted))
+	}
+	if err != nil && s.Policy.Egress == "direct" && s.Policy.Fallback != "" && s.Policy.Fallback != "none" {
+		targetConn, err = s.connectAfterDirectFailure(host, port, err)
 	}
 	if err != nil {
 		// Отправляем ошибку клиенту
@@ -287,6 +290,65 @@ func (s *Socks5) ProcessRequest() error {
 		s.targetConn.RemoteAddr().String(),
 		s.TargetHost, s.TargetPort, s.Policy.Name, s.Policy.Egress, s.Policy.Upstream, s.Policy.DPI)
 	return nil
+}
+
+func dialUpstream(name, host string, port uint16) (net.Conn, error) {
+	upstream, ok := Cfg.Upstreams[name]
+	if !ok {
+		return nil, fmt.Errorf("unknown SOCKS5 upstream %q", name)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), upstream.Timeout())
+	defer cancel()
+	return socksclient.Dial(ctx, upstream, host, port)
+}
+
+func (s *Socks5) connectAfterDirectFailure(host string, port uint16, directErr error) (net.Conn, error) {
+	upstreamName := s.Policy.Fallback
+	log.Printf("[%d] event=direct_connect_failed host=%s fallback=%s error=%v", s.UniqNo, host, upstreamName, directErr)
+	if ProxyMetrics != nil {
+		ProxyMetrics.FallbackResult("connect_failure_candidate", upstreamName)
+	}
+
+	started := time.Now()
+	conn, fallbackErr := dialUpstream(upstreamName, host, port)
+	if ProxyMetrics != nil {
+		result := "success"
+		if fallbackErr != nil {
+			result = "failure"
+		}
+		ProxyMetrics.ObserveDial("socks5", upstreamName, result, time.Since(started))
+	}
+	if fallbackErr != nil {
+		log.Printf("[%d] event=connect_fallback_failed host=%s upstream=%s error=%v", s.UniqNo, host, upstreamName, fallbackErr)
+		if ProxyMetrics != nil {
+			ProxyMetrics.FallbackResult("connect_failure_failed", upstreamName)
+		}
+		return nil, fmt.Errorf("direct connect failed: %v; fallback through %s failed: %w", directErr, upstreamName, fallbackErr)
+	}
+
+	s.Policy.Name = "connect-fallback"
+	s.Policy.Egress = "socks5"
+	s.Policy.DPI = "none"
+	s.Policy.Upstream = upstreamName
+	added := false
+	if LearnedRoutes != nil {
+		var learnErr error
+		added, learnErr = LearnedRoutes.Add(host, upstreamName, "direct-connect-failure-upstream-success")
+		if learnErr != nil {
+			log.Printf("[%d] event=learned_domain_write_failed host=%s error=%v", s.UniqNo, host, learnErr)
+			if ProxyMetrics != nil {
+				ProxyMetrics.FallbackResult("learn_write_failed", upstreamName)
+			}
+		}
+	}
+	log.Printf("[%d] event=connect_fallback_success host=%s upstream=%s learned=%t", s.UniqNo, host, upstreamName, added)
+	if ProxyMetrics != nil {
+		ProxyMetrics.FallbackResult("connect_failure_success", upstreamName)
+		if LearnedRoutes != nil {
+			ProxyMetrics.SetLearnedRoutes(len(LearnedRoutes.Entries()))
+		}
+	}
+	return conn, nil
 }
 
 func successReply(addr net.Addr) []byte {

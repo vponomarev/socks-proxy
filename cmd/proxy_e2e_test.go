@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/vponomarev/socks-proxy/internal/config"
+	"github.com/vponomarev/socks-proxy/internal/monitor"
 	"github.com/vponomarev/socks-proxy/internal/routing"
 )
 
@@ -111,6 +113,84 @@ func TestProxyLearnedDomainUsesFallbackUpstream(t *testing.T) {
 	}
 }
 
+func TestProxyDirectConnectFailureFallsBackAndLearns(t *testing.T) {
+	upstreamAddress, targets, stopUpstream := startEchoSOCKS5(t)
+	defer stopUpstream()
+	cfg := &config.Config{
+		Upstreams: map[string]config.Upstream{
+			"vpn": {Address: upstreamAddress, ConnectTimeout: "1s"},
+		},
+		Detection: config.Detection{FallbackUpstream: "vpn"},
+		Default:   config.DefaultPolicy{Egress: "direct", DPI: "none", Fallback: "vpn"},
+	}
+	store, err := routing.Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	setProxyTestGlobalsWithStore(t, cfg, store)
+	forceDirectDialFailure(t)
+	ProxyMetrics = monitor.New()
+	client, wait := startProxySession(t)
+	defer wait()
+
+	proxyGreeting(t, client)
+	proxyConnect(t, client, "connect-fallback.example", 443)
+	assertEcho(t, client, []byte("connect fallback payload"))
+	client.Close()
+	target := <-targets
+	if target.host != "connect-fallback.example" || target.port != 443 {
+		t.Fatalf("upstream target = %#v", target)
+	}
+	entry, ok := store.Lookup("connect-fallback.example")
+	if !ok || entry.Upstream != "vpn" || entry.Reason != "direct-connect-failure-upstream-success" {
+		t.Fatalf("learned route = %#v, %v", entry, ok)
+	}
+	if ProxyMetrics.Snapshot().FallbackResults["connect_failure_success/vpn"] != 1 {
+		t.Fatalf("fallback metrics = %#v", ProxyMetrics.Snapshot().FallbackResults)
+	}
+}
+
+func TestProxyDirectAndFallbackConnectFailureReturnsError(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	unavailableAddress := listener.Addr().String()
+	listener.Close()
+	cfg := &config.Config{
+		Upstreams: map[string]config.Upstream{
+			"vpn": {Address: unavailableAddress, ConnectTimeout: "100ms"},
+		},
+		Detection: config.Detection{FallbackUpstream: "vpn"},
+		Default:   config.DefaultPolicy{Egress: "direct", DPI: "none", Fallback: "vpn"},
+	}
+	store, err := routing.Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	setProxyTestGlobalsWithStore(t, cfg, store)
+	forceDirectDialFailure(t)
+	client, wait := startProxySession(t)
+	defer wait()
+
+	proxyGreeting(t, client)
+	if reply := proxyConnectReply(t, client, "unreachable.example", 443); reply == 0 {
+		t.Fatal("SOCKS CONNECT unexpectedly succeeded")
+	}
+	if _, ok := store.Lookup("unreachable.example"); ok {
+		t.Fatal("failed fallback was learned")
+	}
+}
+
+func forceDirectDialFailure(t *testing.T) {
+	t.Helper()
+	previous := directDial
+	directDial = func(_, _ string, _ time.Duration) (net.Conn, error) {
+		return nil, errors.New("forced direct dial failure")
+	}
+	t.Cleanup(func() { directDial = previous })
+}
+
 func setProxyTestGlobals(t *testing.T, cfg *config.Config) {
 	t.Helper()
 	store, err := routing.Load("")
@@ -122,9 +202,9 @@ func setProxyTestGlobals(t *testing.T, cfg *config.Config) {
 
 func setProxyTestGlobalsWithStore(t *testing.T, cfg *config.Config, store *routing.Store) {
 	t.Helper()
-	oldConfig, oldRoutes := Cfg, LearnedRoutes
-	Cfg, LearnedRoutes = cfg, store
-	t.Cleanup(func() { Cfg, LearnedRoutes = oldConfig, oldRoutes })
+	oldConfig, oldRoutes, oldMetrics := Cfg, LearnedRoutes, ProxyMetrics
+	Cfg, LearnedRoutes, ProxyMetrics = cfg, store, nil
+	t.Cleanup(func() { Cfg, LearnedRoutes, ProxyMetrics = oldConfig, oldRoutes, oldMetrics })
 }
 
 func startProxySession(t *testing.T) (net.Conn, func()) {
@@ -160,6 +240,13 @@ func proxyGreeting(t *testing.T, conn net.Conn) {
 
 func proxyConnect(t *testing.T, conn net.Conn, host string, port uint16) {
 	t.Helper()
+	if reply := proxyConnectReply(t, conn, host, port); reply != 0 {
+		t.Fatalf("SOCKS CONNECT reply = %d", reply)
+	}
+}
+
+func proxyConnectReply(t *testing.T, conn net.Conn, host string, port uint16) byte {
+	t.Helper()
 	request := []byte{5, 1, 0}
 	ip := net.ParseIP(host)
 	if ip4 := ip.To4(); ip4 != nil {
@@ -179,12 +266,13 @@ func proxyConnect(t *testing.T, conn net.Conn, host string, port uint16) {
 	if _, err := io.ReadFull(conn, header); err != nil {
 		t.Fatal(err)
 	}
-	if header[0] != 5 || header[1] != 0 {
+	if header[0] != 5 {
 		t.Fatalf("SOCKS CONNECT response = %v", header)
 	}
 	if err := discardTestAddress(conn, header[3]); err != nil {
 		t.Fatal(err)
 	}
+	return header[1]
 }
 
 func assertEcho(t *testing.T, conn net.Conn, payload []byte) {
