@@ -31,6 +31,13 @@ upstreams:
     # username: user
     # password: secret
 
+upstream-health:
+  enabled: true
+  interval: 30s
+  timeout: 5s
+  failure-threshold: 3
+  cooldown: 30s
+
 detection:
   first-response-timeout: 3s
   probe-timeout: 5s
@@ -73,7 +80,14 @@ Set `admin.port` to enable the local HTTP server. Keep it bound to `127.0.0.1`; 
 - `/` — live dashboard with sessions, bytes, routing decisions, fallback outcomes, and learned domains.
 - `/api/status` — the dashboard data as JSON.
 - `/api/learned` — learned entries as JSON; `DELETE /api/learned?host=example.com` removes one.
+- `/api/upstreams` — current health and circuit-breaker state for every named upstream.
 - `/metrics` — Prometheus metrics, including Go process metrics.
 - `/healthz` — lightweight process health check.
 
 Counters are process-lifetime values and restart from zero. Learned routes and their usage counters persist in YAML.
+
+## Upstream health and circuit breaker
+
+When `upstream-health.enabled` is true, the proxy periodically connects to each named upstream and completes only the SOCKS5 authentication handshake. It does not open a target connection. Real upstream dials also update health state.
+
+After `failure-threshold` consecutive failures, the circuit opens and new requests fail immediately instead of waiting for another upstream timeout. After `cooldown`, one half-open request is allowed. A successful real request or active health check closes the circuit immediately. Dashboard and Prometheus expose health, circuit state, failures, and operation outcomes.

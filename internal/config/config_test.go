@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestPolicyForStaticSocksWinsOverLearnedRoute(t *testing.T) {
@@ -98,5 +99,23 @@ func TestRejectsInvalidLearnedTTL(t *testing.T) {
 	}
 	if _, err := LoadConfig(path); err == nil {
 		t.Fatal("LoadConfig() accepted invalid learned-domain-ttl")
+	}
+}
+
+func TestUpstreamHealthDefaults(t *testing.T) {
+	health := UpstreamHealth{Enabled: true}
+	if health.CheckInterval() != 30*time.Second || health.CheckTimeout() != 5*time.Second || health.OpenCooldown() != 30*time.Second || health.Threshold() != 3 {
+		t.Fatalf("health defaults = interval %v timeout %v cooldown %v threshold %d", health.CheckInterval(), health.CheckTimeout(), health.OpenCooldown(), health.Threshold())
+	}
+}
+
+func TestRejectsInvalidUpstreamHealth(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "proxy.yml")
+	data := []byte("upstream-health:\n  enabled: true\n  interval: 0s\n")
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(path); err == nil {
+		t.Fatal("LoadConfig() accepted zero health-check interval")
 	}
 }

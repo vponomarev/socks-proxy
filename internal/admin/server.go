@@ -12,12 +12,14 @@ import (
 	"github.com/vponomarev/socks-proxy/internal/config"
 	"github.com/vponomarev/socks-proxy/internal/monitor"
 	"github.com/vponomarev/socks-proxy/internal/routing"
+	"github.com/vponomarev/socks-proxy/internal/upstream"
 )
 
 type API struct {
-	metrics *monitor.Monitor
-	routes  *routing.Store
-	ttl     time.Duration
+	metrics   *monitor.Monitor
+	routes    *routing.Store
+	upstreams *upstream.Manager
+	ttl       time.Duration
 }
 
 type learnedView struct {
@@ -26,22 +28,24 @@ type learnedView struct {
 }
 
 type statusResponse struct {
-	Stats   monitor.Snapshot `json:"stats"`
-	Learned []learnedView    `json:"learned"`
+	Stats     monitor.Snapshot `json:"stats"`
+	Learned   []learnedView    `json:"learned"`
+	Upstreams []upstream.State `json:"upstreams"`
 }
 
-func NewHandler(metrics *monitor.Monitor, routes *routing.Store, ttl time.Duration) http.Handler {
-	api := &API{metrics: metrics, routes: routes, ttl: ttl}
+func NewHandler(metrics *monitor.Monitor, routes *routing.Store, upstreams *upstream.Manager, ttl time.Duration) http.Handler {
+	api := &API{metrics: metrics, routes: routes, upstreams: upstreams, ttl: ttl}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", api.dashboard)
 	mux.HandleFunc("/healthz", api.health)
 	mux.HandleFunc("/api/status", api.status)
 	mux.HandleFunc("/api/learned", api.learned)
+	mux.HandleFunc("/api/upstreams", api.upstreamStates)
 	mux.Handle("/metrics", promhttp.HandlerFor(metrics.Registry(), promhttp.HandlerOpts{}))
 	return mux
 }
 
-func Start(cfg config.Admin, metrics *monitor.Monitor, routes *routing.Store, ttl time.Duration) (*http.Server, error) {
+func Start(cfg config.Admin, metrics *monitor.Monitor, routes *routing.Store, upstreams *upstream.Manager, ttl time.Duration) (*http.Server, error) {
 	address := net.JoinHostPort(cfg.Address, fmt.Sprintf("%d", cfg.Port))
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
@@ -49,7 +53,7 @@ func Start(cfg config.Admin, metrics *monitor.Monitor, routes *routing.Store, tt
 	}
 	server := &http.Server{
 		Addr:              address,
-		Handler:           NewHandler(metrics, routes, ttl),
+		Handler:           NewHandler(metrics, routes, upstreams, ttl),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
@@ -94,7 +98,23 @@ func (a *API) status(w http.ResponseWriter, r *http.Request) {
 	}
 	entries := a.views()
 	a.metrics.SetLearnedRoutes(len(entries))
-	writeJSON(w, http.StatusOK, statusResponse{Stats: a.metrics.Snapshot(), Learned: entries})
+	writeJSON(w, http.StatusOK, statusResponse{Stats: a.metrics.Snapshot(), Learned: entries, Upstreams: a.upstreamViews()})
+}
+
+func (a *API) upstreamStates(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, http.StatusOK, a.upstreamViews())
+}
+
+func (a *API) upstreamViews() []upstream.State {
+	if a.upstreams == nil {
+		return []upstream.State{}
+	}
+	return a.upstreams.States()
 }
 
 func (a *API) learned(w http.ResponseWriter, r *http.Request) {
@@ -148,7 +168,8 @@ const dashboardHTML = `<!doctype html>
 <title>SOCKS Proxy</title><style>
 :root{color-scheme:dark;font:14px system-ui;background:#101418;color:#e6edf3}body{max-width:1200px;margin:32px auto;padding:0 20px}h1{font-size:24px}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}.card,table{background:#182028;border:1px solid #303b45;border-radius:8px}.card{padding:16px}.value{font-size:24px;font-weight:650;margin-top:6px}table{width:100%;border-collapse:collapse;margin-top:20px;overflow:hidden}th,td{padding:10px;text-align:left;border-bottom:1px solid #303b45}th{color:#9fb0bf}button{background:#b42318;color:white;border:0;border-radius:5px;padding:6px 10px;cursor:pointer}a{color:#58a6ff}.muted{color:#9fb0bf}</style></head>
 <body><h1>SOCKS Proxy</h1><p class="muted">Live status · refreshes every 5 seconds · <a href="/metrics">Prometheus metrics</a></p>
-<div class="cards" id="cards"></div><h2>Routing</h2><table><thead><tr><th>Policy / egress / upstream</th><th>Connections</th></tr></thead><tbody id="decisions"></tbody></table>
+<div class="cards" id="cards"></div><h2>Upstreams</h2><table><thead><tr><th>Name</th><th>Address</th><th>Health</th><th>Circuit</th><th>Failures</th><th>Last check</th><th>Error</th></tr></thead><tbody id="upstreams"></tbody></table>
+<h2>Routing</h2><table><thead><tr><th>Policy / egress / upstream</th><th>Connections</th></tr></thead><tbody id="decisions"></tbody></table>
 <h2>Fallback</h2><table><thead><tr><th>Outcome / upstream</th><th>Events</th></tr></thead><tbody id="fallback"></tbody></table>
 <h2>Learned domains</h2><table><thead><tr><th>Host</th><th>Upstream</th><th>Learned</th><th>Last used</th><th>Hits</th><th></th></tr></thead><tbody id="routes"></tbody></table>
 <script>
@@ -157,6 +178,7 @@ async function removeHost(host){if(!confirm('Delete learned route '+host+'?'))re
 async function load(){const r=await fetch('/api/status');const d=await r.json(),s=d.stats;
 const cards=[['Active',s.sessions_active],['Sessions',s.sessions_started],['Completed',s.sessions_completed],['Failed',s.sessions_failed],['Sent bytes',s.bytes_sent],['Received bytes',s.bytes_received],['Learned',s.learned_routes],['Uptime seconds',s.uptime_seconds]];
 document.querySelector('#cards').innerHTML=cards.map(x=>'<div class="card"><div class="muted">'+x[0]+'</div><div class="value">'+fmt(x[1])+'</div></div>').join('');
+document.querySelector('#upstreams').innerHTML=(d.upstreams||[]).map(x=>'<tr><td>'+esc(x.name)+'</td><td>'+esc(x.address)+'</td><td>'+esc(x.health)+'</td><td>'+esc(x.circuit)+'</td><td>'+fmt(x.consecutive_failures)+'</td><td>'+age(x.last_check)+'</td><td>'+esc(x.last_error)+'</td></tr>').join('');
 const rows=o=>Object.entries(o||{}).sort().map(x=>'<tr><td>'+esc(x[0])+'</td><td>'+fmt(x[1])+'</td></tr>').join('');document.querySelector('#decisions').innerHTML=rows(s.route_decisions);document.querySelector('#fallback').innerHTML=rows(s.fallback_results);
 document.querySelector('#routes').innerHTML=d.learned.map(x=>'<tr><td>'+esc(x.host)+'</td><td>'+esc(x.upstream)+'</td><td>'+age(x.learned_at)+'</td><td>'+age(x.last_used_at)+'</td><td>'+fmt(x.hit_count)+'</td><td><button data-host="'+encodeURIComponent(x.host)+'">Delete</button></td></tr>').join('');
 document.querySelectorAll('button[data-host]').forEach(b=>b.onclick=()=>removeHost(decodeURIComponent(b.dataset.host)));}

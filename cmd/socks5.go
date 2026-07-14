@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -15,6 +16,7 @@ import (
 	"github.com/vponomarev/socks-proxy/internal/config"
 	"github.com/vponomarev/socks-proxy/internal/libtls"
 	"github.com/vponomarev/socks-proxy/internal/socksclient"
+	"github.com/vponomarev/socks-proxy/internal/upstream"
 )
 
 var (
@@ -114,6 +116,9 @@ func (s *Socks5) AcceptConnection() {
 	// Обработка запроса SOCKS5
 	err := s.ProcessRequest()
 	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return
+		}
 		log.Printf("[%d] Request failed [%s:%d :%v]: %v", s.UniqNo, s.TargetHost, s.TargetPort, s.IsTargetIP, err)
 		return
 	}
@@ -293,13 +298,34 @@ func (s *Socks5) ProcessRequest() error {
 }
 
 func dialUpstream(name, host string, port uint16) (net.Conn, error) {
-	upstream, ok := Cfg.Upstreams[name]
+	cfgUpstream, ok := Cfg.Upstreams[name]
 	if !ok {
 		return nil, fmt.Errorf("unknown SOCKS5 upstream %q", name)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), upstream.Timeout())
+	if UpstreamManager != nil && !UpstreamManager.Allow(name) {
+		if ProxyMetrics != nil {
+			ProxyMetrics.UpstreamResult(name, "circuit_rejected")
+			if state, exists := UpstreamManager.State(name); exists {
+				ProxyMetrics.SetUpstreamState(name, state.Health, state.Circuit)
+			}
+		}
+		return nil, fmt.Errorf("upstream %s: %w", name, upstream.ErrCircuitOpen)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), cfgUpstream.Timeout())
 	defer cancel()
-	return socksclient.Dial(ctx, upstream, host, port)
+	conn, err := socksclient.Dial(ctx, cfgUpstream, host, port)
+	if UpstreamManager != nil {
+		state := UpstreamManager.Record(name, err)
+		if ProxyMetrics != nil {
+			result := "dial_success"
+			if err != nil {
+				result = "dial_failure"
+			}
+			ProxyMetrics.UpstreamResult(name, result)
+			ProxyMetrics.SetUpstreamState(name, state.Health, state.Circuit)
+		}
+	}
+	return conn, err
 }
 
 func (s *Socks5) connectAfterDirectFailure(host string, port uint16, directErr error) (net.Conn, error) {

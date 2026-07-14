@@ -13,6 +13,7 @@ import (
 	"github.com/vponomarev/socks-proxy/internal/config"
 	"github.com/vponomarev/socks-proxy/internal/monitor"
 	"github.com/vponomarev/socks-proxy/internal/routing"
+	"github.com/vponomarev/socks-proxy/internal/upstream"
 )
 
 func TestProxyDirectEndToEnd(t *testing.T) {
@@ -182,6 +183,20 @@ func TestProxyDirectAndFallbackConnectFailureReturnsError(t *testing.T) {
 	}
 }
 
+func TestDialUpstreamRejectsOpenCircuit(t *testing.T) {
+	cfg := &config.Config{
+		Upstreams: map[string]config.Upstream{"vpn": {Address: "127.0.0.1:1", ConnectTimeout: "100ms"}},
+	}
+	setProxyTestGlobals(t, cfg)
+	UpstreamManager = upstream.New(cfg.Upstreams, config.UpstreamHealth{
+		Enabled: true, FailureThreshold: 1, Cooldown: "1h",
+	})
+	UpstreamManager.Record("vpn", errors.New("offline"))
+	if _, err := dialUpstream("vpn", "example.com", 443); !errors.Is(err, upstream.ErrCircuitOpen) {
+		t.Fatalf("dialUpstream() error = %v; want ErrCircuitOpen", err)
+	}
+}
+
 func forceDirectDialFailure(t *testing.T) {
 	t.Helper()
 	previous := directDial
@@ -202,9 +217,11 @@ func setProxyTestGlobals(t *testing.T, cfg *config.Config) {
 
 func setProxyTestGlobalsWithStore(t *testing.T, cfg *config.Config, store *routing.Store) {
 	t.Helper()
-	oldConfig, oldRoutes, oldMetrics := Cfg, LearnedRoutes, ProxyMetrics
-	Cfg, LearnedRoutes, ProxyMetrics = cfg, store, nil
-	t.Cleanup(func() { Cfg, LearnedRoutes, ProxyMetrics = oldConfig, oldRoutes, oldMetrics })
+	oldConfig, oldRoutes, oldMetrics, oldUpstreams := Cfg, LearnedRoutes, ProxyMetrics, UpstreamManager
+	Cfg, LearnedRoutes, ProxyMetrics, UpstreamManager = cfg, store, nil, nil
+	t.Cleanup(func() {
+		Cfg, LearnedRoutes, ProxyMetrics, UpstreamManager = oldConfig, oldRoutes, oldMetrics, oldUpstreams
+	})
 }
 
 func startProxySession(t *testing.T) (net.Conn, func()) {

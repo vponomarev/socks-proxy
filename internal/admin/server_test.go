@@ -9,8 +9,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/vponomarev/socks-proxy/internal/config"
 	"github.com/vponomarev/socks-proxy/internal/monitor"
 	"github.com/vponomarev/socks-proxy/internal/routing"
+	"github.com/vponomarev/socks-proxy/internal/upstream"
 )
 
 func TestDashboardStatusMetricsAndDelete(t *testing.T) {
@@ -24,7 +26,8 @@ func TestDashboardStatusMetricsAndDelete(t *testing.T) {
 	metrics := monitor.New()
 	metrics.SessionStarted()
 	metrics.SessionFinished(12, 34, time.Second, "direct", "completed")
-	handler := NewHandler(metrics, store, 24*time.Hour)
+	upstreams := upstream.New(map[string]config.Upstream{"vpn": {Address: "vpn:1080"}}, config.UpstreamHealth{})
+	handler := NewHandler(metrics, store, upstreams, 24*time.Hour)
 
 	dashboard := httptest.NewRecorder()
 	handler.ServeHTTP(dashboard, httptest.NewRequest(http.MethodGet, "/", nil))
@@ -38,7 +41,7 @@ func TestDashboardStatusMetricsAndDelete(t *testing.T) {
 	if err := json.NewDecoder(status.Body).Decode(&response); err != nil {
 		t.Fatal(err)
 	}
-	if response.Stats.SessionsStarted != 1 || len(response.Learned) != 1 || response.Learned[0].ExpiresAt.IsZero() {
+	if response.Stats.SessionsStarted != 1 || len(response.Learned) != 1 || response.Learned[0].ExpiresAt.IsZero() || len(response.Upstreams) != 1 {
 		t.Fatalf("status response = %#v", response)
 	}
 

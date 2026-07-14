@@ -18,6 +18,7 @@ type Snapshot struct {
 	BytesReceived    uint64            `json:"bytes_received"`
 	RouteDecisions   map[string]uint64 `json:"route_decisions"`
 	FallbackResults  map[string]uint64 `json:"fallback_results"`
+	UpstreamResults  map[string]uint64 `json:"upstream_results"`
 	LearnedRoutes    int               `json:"learned_routes"`
 }
 
@@ -36,6 +37,9 @@ type Monitor struct {
 	dialDuration     *prometheus.HistogramVec
 	sessionDuration  *prometheus.HistogramVec
 	learnedRoutes    prometheus.Gauge
+	upstreamResults  *prometheus.CounterVec
+	upstreamHealthy  *prometheus.GaugeVec
+	upstreamOpen     *prometheus.GaugeVec
 }
 
 func New() *Monitor {
@@ -81,13 +85,27 @@ func New() *Monitor {
 			Name: "socks_proxy_learned_routes",
 			Help: "Current number of learned domain routes.",
 		}),
+		upstreamResults: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "socks_proxy_upstream_results_total",
+			Help: "SOCKS5 upstream operations by result.",
+		}, []string{"upstream", "result"}),
+		upstreamHealthy: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "socks_proxy_upstream_healthy",
+			Help: "Whether the latest upstream operation succeeded (1 healthy, 0 unhealthy).",
+		}, []string{"upstream"}),
+		upstreamOpen: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "socks_proxy_upstream_circuit_open",
+			Help: "Whether the upstream circuit breaker is open or half-open.",
+		}, []string{"upstream"}),
 	}
 	m.snapshot.StartedAt = m.started
 	m.snapshot.RouteDecisions = make(map[string]uint64)
 	m.snapshot.FallbackResults = make(map[string]uint64)
+	m.snapshot.UpstreamResults = make(map[string]uint64)
 	registry.MustRegister(
 		m.sessionsStarted, m.sessionsActive, m.sessionsFinished, m.bytes,
 		m.routes, m.fallback, m.dialDuration, m.sessionDuration, m.learnedRoutes,
+		m.upstreamResults, m.upstreamHealthy, m.upstreamOpen,
 		prometheus.NewGoCollector(), prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}),
 	)
 	return m
@@ -164,6 +182,27 @@ func (m *Monitor) SetLearnedRoutes(count int) {
 	m.learnedRoutes.Set(float64(count))
 }
 
+func (m *Monitor) UpstreamResult(name, result string) {
+	key := name + "/" + result
+	m.mu.Lock()
+	m.snapshot.UpstreamResults[key]++
+	m.mu.Unlock()
+	m.upstreamResults.WithLabelValues(name, result).Inc()
+}
+
+func (m *Monitor) SetUpstreamState(name, health, circuit string) {
+	healthy := 0.0
+	if health == "healthy" {
+		healthy = 1
+	}
+	open := 0.0
+	if circuit == "open" || circuit == "half-open" {
+		open = 1
+	}
+	m.upstreamHealthy.WithLabelValues(name).Set(healthy)
+	m.upstreamOpen.WithLabelValues(name).Set(open)
+}
+
 func (m *Monitor) Snapshot() Snapshot {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -171,6 +210,7 @@ func (m *Monitor) Snapshot() Snapshot {
 	result.UptimeSeconds = int64(time.Since(m.started).Seconds())
 	result.RouteDecisions = cloneMap(m.snapshot.RouteDecisions)
 	result.FallbackResults = cloneMap(m.snapshot.FallbackResults)
+	result.UpstreamResults = cloneMap(m.snapshot.UpstreamResults)
 	return result
 }
 
