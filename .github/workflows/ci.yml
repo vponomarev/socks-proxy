@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Install packet capture headers
+        run: sudo apt-get update && sudo apt-get install --yes libpcap-dev
+
+      - name: Run race tests
+        run: go test -race ./...
+
+      - name: Run vet
+        run: go vet ./...
+
+      - name: Verify portable release builds
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildvcs=false -trimpath -o /tmp/socks-proxy-linux-amd64 ./cmd
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -buildvcs=false -trimpath -o /tmp/socks-proxy-windows-amd64.exe ./cmd

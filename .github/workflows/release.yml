@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate semantic version tag
+        shell: bash
+        run: |
+          if [[ ! "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Tag must use vMAJOR.MINOR.PATCH format" >&2
+            exit 1
+          fi
+
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Run tests
+        run: CGO_ENABLED=0 go test ./...
+
+      - name: Build portable binaries
+        shell: bash
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildvcs=false -trimpath -ldflags="-s -w" -o dist/socks-proxy-linux-amd64 ./cmd
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -buildvcs=false -trimpath -ldflags="-s -w" -o dist/socks-proxy-windows-amd64.exe ./cmd
+          cp cmd/proxy.example.yml dist/proxy.example.yml
+          cp cmd/vpn-proxy.example.yml dist/vpn-proxy.example.yml
+          (cd dist && sha256sum socks-proxy-* > SHA256SUMS)
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/socks-proxy-linux-amd64 \
+            dist/socks-proxy-windows-amd64.exe \
+            dist/proxy.example.yml \
+            dist/vpn-proxy.example.yml \
+            dist/SHA256SUMS \
+            --verify-tag \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes
