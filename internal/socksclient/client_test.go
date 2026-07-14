@@ -72,6 +72,45 @@ func TestDialUsesDomainAddress(t *testing.T) {
 	}
 }
 
+func TestCheckCompletesSOCKSHandshakeWithoutConnect(t *testing.T) {
+	client, server := net.Pipe()
+	done := make(chan error, 1)
+	go func() {
+		defer server.Close()
+		header := make([]byte, 2)
+		if _, err := io.ReadFull(server, header); err != nil {
+			done <- err
+			return
+		}
+		methods := make([]byte, int(header[1]))
+		if _, err := io.ReadFull(server, methods); err != nil {
+			done <- err
+			return
+		}
+		if _, err := server.Write([]byte{5, 0}); err != nil {
+			done <- err
+			return
+		}
+		one := make([]byte, 1)
+		_, err := server.Read(one)
+		if err == io.EOF {
+			err = nil
+		}
+		done <- err
+	}()
+
+	originalDial := dialContext
+	dialContext = func(context.Context, string, string) (net.Conn, error) { return client, nil }
+	t.Cleanup(func() { dialContext = originalDial })
+
+	if err := Check(context.Background(), config.Upstream{Address: "upstream:1080", ConnectTimeout: "1s"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 type unexpectedTarget struct {
 	host string
 	port uint16

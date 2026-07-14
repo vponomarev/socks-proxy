@@ -56,6 +56,31 @@ func Dial(ctx context.Context, upstream config.Upstream, host string, port uint1
 	return conn, nil
 }
 
+// Check verifies that the upstream accepts a TCP connection and completes the
+// SOCKS5 authentication handshake. It intentionally does not open a target
+// connection, so periodic health checks do not generate external traffic.
+func Check(ctx context.Context, upstream config.Upstream) error {
+	if upstream.Address == "" {
+		return fmt.Errorf("SOCKS5 upstream address is empty")
+	}
+	dialCtx, cancel := context.WithTimeout(ctx, upstream.Timeout())
+	defer cancel()
+	conn, err := dialContext(dialCtx, "tcp", upstream.Address)
+	if err != nil {
+		return fmt.Errorf("connect to SOCKS5 upstream %s: %w", upstream.Address, err)
+	}
+	defer conn.Close()
+	if deadline, hasDeadline := dialCtx.Deadline(); hasDeadline {
+		if err := conn.SetDeadline(deadline); err != nil {
+			return err
+		}
+	}
+	if err := negotiate(conn, upstream); err != nil {
+		return fmt.Errorf("SOCKS5 upstream handshake: %w", err)
+	}
+	return nil
+}
+
 func negotiate(conn net.Conn, upstream config.Upstream) error {
 	methods := []byte{methodNoAuth}
 	if upstream.Username != "" || upstream.Password != "" {

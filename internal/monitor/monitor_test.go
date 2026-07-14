@@ -12,6 +12,8 @@ func TestSnapshotTracksSessionsRoutesAndFallback(t *testing.T) {
 	m.FallbackResult("success", "vpn")
 	m.SessionFinished(100, 200, time.Second, "socks5", "completed")
 	m.SetLearnedRoutes(3)
+	m.UpstreamResult("vpn", "health_check_success")
+	m.SetUpstreamState("vpn", "healthy", "closed")
 
 	snapshot := m.Snapshot()
 	if snapshot.SessionsStarted != 1 || snapshot.SessionsActive != 0 || snapshot.SessionsComplete != 1 {
@@ -22,5 +24,8 @@ func TestSnapshotTracksSessionsRoutesAndFallback(t *testing.T) {
 	}
 	if snapshot.RouteDecisions["learned-domain/socks5/vpn"] != 1 || snapshot.FallbackResults["success/vpn"] != 1 {
 		t.Fatalf("decision snapshot = %#v", snapshot)
+	}
+	if snapshot.UpstreamResults["vpn/health_check_success"] != 1 {
+		t.Fatalf("upstream snapshot = %#v", snapshot.UpstreamResults)
 	}
 }

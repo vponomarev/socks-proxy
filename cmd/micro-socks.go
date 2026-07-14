@@ -13,6 +13,7 @@ import (
 	"github.com/vponomarev/socks-proxy/internal/config"
 	"github.com/vponomarev/socks-proxy/internal/monitor"
 	"github.com/vponomarev/socks-proxy/internal/routing"
+	"github.com/vponomarev/socks-proxy/internal/upstream"
 )
 
 const (
@@ -28,13 +29,14 @@ type Fragmenter struct {
 }
 
 var (
-	RSB           RingSessionBuffer
-	SerSentBuffer chan gopacket.SerializeBuffer
-	paramTTL      = flag.Int("ttl", 7, "TTL for fake packets")
-	configPath    = flag.String("config", "proxy.yml", "Path to config file, default `proxy.yml`")
-	Cfg           *config.Config
-	LearnedRoutes *routing.Store
-	ProxyMetrics  *monitor.Monitor
+	RSB             RingSessionBuffer
+	SerSentBuffer   chan gopacket.SerializeBuffer
+	paramTTL        = flag.Int("ttl", 7, "TTL for fake packets")
+	configPath      = flag.String("config", "proxy.yml", "Path to config file, default `proxy.yml`")
+	Cfg             *config.Config
+	LearnedRoutes   *routing.Store
+	ProxyMetrics    *monitor.Monitor
+	UpstreamManager *upstream.Manager
 )
 
 func CaptureSessionInfo(conn net.Conn) (ok bool, si SessionInfo) {
@@ -70,11 +72,18 @@ func main() {
 	}
 	ProxyMetrics = monitor.New()
 	ProxyMetrics.SetLearnedRoutes(len(LearnedRoutes.Entries()))
+	UpstreamManager = upstream.New(Cfg.Upstreams, Cfg.UpstreamHealth)
+	for _, state := range UpstreamManager.States() {
+		ProxyMetrics.SetUpstreamState(state.Name, state.Health, state.Circuit)
+	}
+	if UpstreamManager.Enabled() {
+		go monitorUpstreamHealth(context.Background())
+	}
 	log.Printf("Loaded %d learned domain routes", len(LearnedRoutes.Entries()))
 	go maintainLearnedRoutes(ttl)
 
 	if Cfg.Admin.Enabled() {
-		if _, err := admin.Start(Cfg.Admin, ProxyMetrics, LearnedRoutes, ttl); err != nil {
+		if _, err := admin.Start(Cfg.Admin, ProxyMetrics, LearnedRoutes, UpstreamManager, ttl); err != nil {
 			log.Fatalf("Failed to start admin server: %v", err)
 		}
 		log.Printf("Admin dashboard started on http://%s:%d/", Cfg.Admin.Address, Cfg.Admin.Port)
@@ -116,6 +125,31 @@ func main() {
 		}
 		CntNo++
 		go inst.AcceptConnection()
+	}
+}
+
+func monitorUpstreamHealth(ctx context.Context) {
+	check := func() {
+		for _, state := range UpstreamManager.CheckAll(ctx) {
+			ProxyMetrics.SetUpstreamState(state.Name, state.Health, state.Circuit)
+			result := "health_check_success"
+			if state.Health != "healthy" {
+				result = "health_check_failure"
+				log.Printf("Upstream health check failed name=%s circuit=%s failures=%d error=%s", state.Name, state.Circuit, state.ConsecutiveFailures, state.LastError)
+			}
+			ProxyMetrics.UpstreamResult(state.Name, result)
+		}
+	}
+	check()
+	ticker := time.NewTicker(Cfg.UpstreamHealth.CheckInterval())
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			check()
+		}
 	}
 }
 

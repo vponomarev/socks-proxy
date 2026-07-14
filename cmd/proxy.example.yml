@@ -17,6 +17,13 @@ upstreams:
     address: "172.31.1.100:8888"
     connect-timeout: 5s
 
+upstream-health:
+  enabled: true
+  interval: 30s
+  timeout: 5s
+  failure-threshold: 3
+  cooldown: 30s
+
 detection:
   first-response-timeout: 3s
   probe-timeout: 5s

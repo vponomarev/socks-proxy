@@ -69,6 +69,33 @@ type Admin struct {
 	Port    int    `yaml:"port"`
 }
 
+type UpstreamHealth struct {
+	Enabled          bool   `yaml:"enabled"`
+	Interval         string `yaml:"interval"`
+	Timeout          string `yaml:"timeout"`
+	FailureThreshold int    `yaml:"failure-threshold"`
+	Cooldown         string `yaml:"cooldown"`
+}
+
+func (h UpstreamHealth) CheckInterval() time.Duration {
+	return parseDuration(h.Interval, 30*time.Second)
+}
+
+func (h UpstreamHealth) CheckTimeout() time.Duration {
+	return parseDuration(h.Timeout, 5*time.Second)
+}
+
+func (h UpstreamHealth) OpenCooldown() time.Duration {
+	return parseDuration(h.Cooldown, 30*time.Second)
+}
+
+func (h UpstreamHealth) Threshold() int {
+	if h.FailureThreshold <= 0 {
+		return 3
+	}
+	return h.FailureThreshold
+}
+
 func (a Admin) Enabled() bool {
 	return a.Port > 0
 }
@@ -90,13 +117,14 @@ type ResolvedPolicy struct {
 }
 
 type Config struct {
-	Proxy     Proxy               `yaml:"proxy"`
-	Admin     Admin               `yaml:"admin"`
-	FakeSni   FakeSni             `yaml:"fake-sni"`
-	Upstreams map[string]Upstream `yaml:"upstreams"`
-	Detection Detection           `yaml:"detection"`
-	Default   DefaultPolicy       `yaml:"default"`
-	Strategy  []Strategy          `yaml:"strategy"`
+	Proxy          Proxy               `yaml:"proxy"`
+	Admin          Admin               `yaml:"admin"`
+	FakeSni        FakeSni             `yaml:"fake-sni"`
+	Upstreams      map[string]Upstream `yaml:"upstreams"`
+	UpstreamHealth UpstreamHealth      `yaml:"upstream-health"`
+	Detection      Detection           `yaml:"detection"`
+	Default        DefaultPolicy       `yaml:"default"`
+	Strategy       []Strategy          `yaml:"strategy"`
 }
 
 func LoadConfig(path string) (config *Config, err error) {
@@ -218,6 +246,27 @@ func (c *Config) Validate() error {
 	}
 	if c.Admin.Port < 0 || c.Admin.Port > 65535 {
 		return fmt.Errorf("admin port must be between 1 and 65535")
+	}
+	if c.UpstreamHealth.Enabled {
+		for name, value := range map[string]string{
+			"interval": c.UpstreamHealth.Interval,
+			"timeout":  c.UpstreamHealth.Timeout,
+			"cooldown": c.UpstreamHealth.Cooldown,
+		} {
+			if value == "" {
+				continue
+			}
+			duration, err := time.ParseDuration(value)
+			if err != nil {
+				return fmt.Errorf("upstream-health %s: %w", name, err)
+			}
+			if duration <= 0 {
+				return fmt.Errorf("upstream-health %s must be positive", name)
+			}
+		}
+		if c.UpstreamHealth.FailureThreshold < 0 {
+			return fmt.Errorf("upstream-health failure-threshold must not be negative")
+		}
 	}
 	for _, s := range c.Strategy {
 		if err := c.validatePolicy(s.Name, s.Egress, s.DPI, s.Upstream, s.Fallback); err != nil {
