@@ -14,12 +14,18 @@ import (
 
 type LearnedDomain struct {
 	Host       string    `yaml:"host" json:"host"`
-	Upstream   string    `yaml:"upstream" json:"upstream"`
+	Route      string    `yaml:"route,omitempty" json:"route"`
+	Upstream   string    `yaml:"upstream,omitempty" json:"upstream,omitempty"`
 	LearnedAt  time.Time `yaml:"learned-at" json:"learned_at"`
 	LastUsedAt time.Time `yaml:"last-used-at,omitempty" json:"last_used_at,omitempty"`
 	HitCount   uint64    `yaml:"hit-count,omitempty" json:"hit_count"`
 	Reason     string    `yaml:"reason" json:"reason"`
 }
+
+const (
+	RouteSOCKS5 = "socks5"
+	RouteBye    = "direct+bye"
+)
 
 type learnedFile struct {
 	Version int             `yaml:"version"`
@@ -58,7 +64,12 @@ func Load(path string) (*Store, error) {
 	}
 	for _, entry := range file.Domains {
 		entry.Host = normalizeHost(entry.Host)
-		if entry.Host == "" || entry.Upstream == "" {
+		// Version 1 files only stored an upstream and therefore always meant
+		// SOCKS5. Infer the route to keep existing learned files usable.
+		if entry.Route == "" && entry.Upstream != "" {
+			entry.Route = RouteSOCKS5
+		}
+		if entry.Host == "" || !validRoute(entry.Route, entry.Upstream) {
 			continue
 		}
 		store.domains[entry.Host] = entry
@@ -109,18 +120,24 @@ func (s *Store) Add(host, upstream, reason string) (bool, error) {
 // exceed maxEntries, the least recently used route is evicted atomically with
 // the update. A non-positive limit disables eviction.
 func (s *Store) AddWithLimit(host, upstream, reason string, maxEntries int) (bool, *LearnedDomain, error) {
+	return s.AddRouteWithLimit(host, RouteSOCKS5, upstream, reason, maxEntries)
+}
+
+// AddRouteWithLimit adds or replaces an exact-host route. direct+bye routes
+// have no upstream; socks5 routes require one.
+func (s *Store) AddRouteWithLimit(host, route, upstream, reason string, maxEntries int) (bool, *LearnedDomain, error) {
 	host = normalizeHost(host)
 	if host == "" {
 		return false, nil, fmt.Errorf("learned domain host is empty")
 	}
-	if upstream == "" {
-		return false, nil, fmt.Errorf("learned domain upstream is empty")
+	if !validRoute(route, upstream) {
+		return false, nil, fmt.Errorf("invalid learned route %q with upstream %q", route, upstream)
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	current, existed := s.domains[host]
-	if existed && current.Upstream == upstream {
+	if existed && current.Route == route && current.Upstream == upstream {
 		return false, nil, nil
 	}
 	var evicted *LearnedDomain
@@ -134,6 +151,7 @@ func (s *Store) AddWithLimit(host, upstream, reason string, maxEntries int) (boo
 	}
 	s.domains[host] = LearnedDomain{
 		Host:      host,
+		Route:     route,
 		Upstream:  upstream,
 		LearnedAt: time.Now(),
 		Reason:    reason,
@@ -151,6 +169,17 @@ func (s *Store) AddWithLimit(host, upstream, reason string, maxEntries int) (boo
 	}
 	s.dirty = false
 	return true, evicted, nil
+}
+
+func validRoute(route, upstream string) bool {
+	switch route {
+	case RouteSOCKS5:
+		return upstream != ""
+	case RouteBye:
+		return upstream == ""
+	default:
+		return false
+	}
 }
 
 func (s *Store) evictionCandidateLocked() *LearnedDomain {
@@ -288,7 +317,7 @@ func (s *Store) saveLocked() error {
 		entries = append(entries, entry)
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Host < entries[j].Host })
-	data, err := yaml.Marshal(learnedFile{Version: 1, Domains: entries})
+	data, err := yaml.Marshal(learnedFile{Version: 2, Domains: entries})
 	if err != nil {
 		return fmt.Errorf("encode learned domains: %w", err)
 	}
