@@ -1,0 +1,27 @@
+proxy:
+  address: "0.0.0.0"
+  port: 1080
+  shutdown-timeout: 15s
+
+admin:
+  address: "127.0.0.1"
+  port: 9090
+
+# Use the outbound interface visible to libpcap. MTU is detected by interface
+# name when possible. The TTL must be calibrated separately for each provider.
+fake-sni:
+  interface: "eth0"
+  ttl: 2
+  mtu: 1500
+  decoy: "vpnc.ru"
+
+default:
+  egress: direct
+  dpi: none
+
+strategy:
+  - name: experimental-fake-sni
+    list: "example-lists/fake-sni.txt"
+    egress: direct
+    dpi: fake-sni
+    fallback: none

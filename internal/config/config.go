@@ -36,6 +36,35 @@ func (p Proxy) GracefulTimeout() time.Duration {
 type FakeSni struct {
 	Interface string `yaml:"interface"`
 	Ttl       int    `yaml:"ttl"`
+	MTU       int    `yaml:"mtu"`
+	Decoy     string `yaml:"decoy"`
+}
+
+// Bye configures application-level ClientHello splitting. It deliberately
+// uses ordinary TCP sockets so it works on Windows and Linux without packet
+// capture privileges.
+type Bye struct {
+	Mode        string `yaml:"mode"`
+	SplitOffset int    `yaml:"split-offset"`
+	Delay       string `yaml:"delay"`
+}
+
+func (b Bye) SplitMode() string {
+	if b.Mode == "" {
+		return "tcp-split"
+	}
+	return strings.ToLower(b.Mode)
+}
+
+func (b Bye) Offset() int {
+	if b.SplitOffset <= 0 {
+		return 3
+	}
+	return b.SplitOffset
+}
+
+func (b Bye) SplitDelay() time.Duration {
+	return parseDuration(b.Delay, 15*time.Millisecond)
 }
 
 type Upstream struct {
@@ -154,6 +183,7 @@ type Config struct {
 	Proxy          Proxy               `yaml:"proxy"`
 	Admin          Admin               `yaml:"admin"`
 	FakeSni        FakeSni             `yaml:"fake-sni"`
+	Bye            Bye                 `yaml:"bye"`
 	Upstreams      map[string]Upstream `yaml:"upstreams"`
 	UpstreamHealth UpstreamHealth      `yaml:"upstream-health"`
 	Detection      Detection           `yaml:"detection"`
@@ -250,7 +280,7 @@ func (c *Config) normalizeStrategy(s *Strategy) {
 	}
 	if s.DPI == "" {
 		switch strings.ToLower(s.Action) {
-		case "fake-sni", "fragment":
+		case "fake-sni", "fragment", "bye":
 			s.DPI = strings.ToLower(s.Action)
 		default:
 			s.DPI = "none"
@@ -265,6 +295,24 @@ func (c *Config) normalizeStrategy(s *Strategy) {
 }
 
 func (c *Config) Validate() error {
+	if c.FakeSni.MTU != 0 && (c.FakeSni.MTU < 576 || c.FakeSni.MTU > 65535) {
+		return fmt.Errorf("fake-sni mtu must be between 576 and 65535")
+	}
+	if mode := c.Bye.SplitMode(); mode != "tcp-split" && mode != "tlsrec" {
+		return fmt.Errorf("bye mode must be tcp-split or tlsrec")
+	}
+	if c.Bye.SplitOffset < 0 {
+		return fmt.Errorf("bye split-offset must not be negative")
+	}
+	if c.Bye.Delay != "" {
+		delay, err := time.ParseDuration(c.Bye.Delay)
+		if err != nil {
+			return fmt.Errorf("bye delay: %w", err)
+		}
+		if delay < 0 || delay > time.Second {
+			return fmt.Errorf("bye delay must be between 0 and 1s")
+		}
+	}
 	if c.Proxy.ShutdownTimeout != "" {
 		timeout, err := time.ParseDuration(c.Proxy.ShutdownTimeout)
 		if err != nil {
@@ -351,7 +399,7 @@ func (c *Config) validatePolicy(name, egress, dpi, upstream, fallback string) er
 	if egress != "direct" && egress != "socks5" {
 		return fmt.Errorf("policy %q has unsupported egress %q", name, egress)
 	}
-	if dpi != "none" && dpi != "fragment" && dpi != "fake-sni" {
+	if dpi != "none" && dpi != "fragment" && dpi != "fake-sni" && dpi != "bye" {
 		return fmt.Errorf("policy %q has unsupported dpi mode %q", name, dpi)
 	}
 	if egress == "socks5" {
@@ -367,7 +415,7 @@ func (c *Config) validatePolicy(name, egress, dpi, upstream, fallback string) er
 	return nil
 }
 
-func (c *Config) PolicyFor(host string, learnedUpstream string) ResolvedPolicy {
+func (c *Config) PolicyFor(host, learnedRoute, learnedUpstream string) ResolvedPolicy {
 	policy := ResolvedPolicy{
 		Name:     "default",
 		Egress:   c.Default.Egress,
@@ -380,14 +428,14 @@ func (c *Config) PolicyFor(host string, learnedUpstream string) ResolvedPolicy {
 	}
 
 	for _, strategy := range c.Strategy {
-		if strategy.matches(host) {
+		if matched, params := strategy.match(host); matched {
 			policy = ResolvedPolicy{
 				Name:     strategy.Name,
 				Egress:   strategy.Egress,
 				DPI:      strategy.DPI,
 				Upstream: strategy.Upstream,
 				Fallback: strategy.Fallback,
-				Params:   strategy.Params,
+				Params:   params,
 			}
 			break
 		}
@@ -396,7 +444,12 @@ func (c *Config) PolicyFor(host string, learnedUpstream string) ResolvedPolicy {
 	// A statically selected SOCKS5 upstream always wins. Learned routing only
 	// replaces direct policies which permit fallback.
 	_, learnedUpstreamExists := c.Upstreams[learnedUpstream]
-	if learnedUpstreamExists && policy.Egress != "socks5" && policy.Fallback != "none" {
+	if learnedRoute == "direct+bye" && policy.Egress != "socks5" && policy.Fallback != "none" {
+		policy.Name = "learned-domain-bye"
+		policy.Egress = "direct"
+		policy.DPI = "bye"
+		policy.Upstream = ""
+	} else if learnedRoute == "socks5" && learnedUpstreamExists && policy.Egress != "socks5" && policy.Fallback != "none" {
 		policy.Name = "learned-domain"
 		policy.Egress = "socks5"
 		policy.DPI = "none"
@@ -405,14 +458,23 @@ func (c *Config) PolicyFor(host string, learnedUpstream string) ResolvedPolicy {
 	return policy
 }
 
-func (s Strategy) matches(host string) bool {
+func (s Strategy) match(host string) (bool, map[string]string) {
 	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
 	for _, record := range s.ListRecords {
 		if record.Regexp != nil && record.Regexp.MatchString(host) {
-			return true
+			params := make(map[string]string, len(s.Params)+1)
+			for key, value := range s.Params {
+				params[key] = value
+			}
+			if record.Actions != nil {
+				for key, value := range *record.Actions {
+					params[key] = value
+				}
+			}
+			return true, params
 		}
 	}
-	return false
+	return false, nil
 }
 
 func recordsMatch(records []DomainRecord, host string) bool {
@@ -434,6 +496,19 @@ func (p ResolvedPolicy) TTL(defaultTTL int) int {
 		return defaultTTL
 	}
 	return ttl
+}
+
+func (p ResolvedPolicy) FakeSNI(defaultDecoy, original string) string {
+	if p.Params != nil && strings.TrimSpace(p.Params["fake-sni"]) != "" {
+		return strings.TrimSpace(p.Params["fake-sni"])
+	}
+	if strings.TrimSpace(defaultDecoy) != "" {
+		return strings.TrimSpace(defaultDecoy)
+	}
+	if len(original) == 0 {
+		return ""
+	}
+	return original[:len(original)-1] + "x"
 }
 
 func parseDuration(value string, fallback time.Duration) time.Duration {

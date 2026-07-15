@@ -27,6 +27,9 @@ var (
 	directDial     = func(network, address string, timeout time.Duration) (net.Conn, error) {
 		return (&net.Dialer{Timeout: timeout}).Dial(network, address)
 	}
+	directDialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, address)
+	}
 )
 
 type probeCoordinator struct {
@@ -275,13 +278,14 @@ func (s *Socks5) ProcessRequest() error {
 	}
 
 	// Устанавливаем соединение с целевым сервером
-	learnedUpstream := ""
+	learnedRoute, learnedUpstream := "", ""
 	if LearnedRoutes != nil {
 		if learned, ok := LearnedRoutes.LookupActive(s.TargetHost, cfg.Detection.LearnedTTL(), time.Now()); ok {
+			learnedRoute = learned.Route
 			learnedUpstream = learned.Upstream
 		}
 	}
-	s.Policy = cfg.PolicyFor(s.TargetHost, learnedUpstream)
+	s.Policy = cfg.PolicyFor(s.TargetHost, learnedRoute, learnedUpstream)
 
 	var targetConn net.Conn
 	var err error
@@ -323,7 +327,7 @@ func (s *Socks5) ProcessRequest() error {
 	if ProxyMetrics != nil {
 		ProxyMetrics.RouteDecision(s.Policy.Name, s.Policy.Egress, s.Policy.Upstream)
 	}
-	if s.Policy.Name == "learned-domain" && LearnedRoutes != nil {
+	if strings.HasPrefix(s.Policy.Name, "learned-domain") && LearnedRoutes != nil {
 		LearnedRoutes.MarkUsed(s.TargetHost, time.Now())
 	}
 
@@ -521,10 +525,10 @@ func (s *Socks5) DoInject(data []byte) {
 				//}
 				err, pkt := PrepareFakePacket(si, uint8(*paramTTL), fp)
 				if err == nil {
-					SerSentBuffer <- pkt
-
-					log.Printf("[%d] Injected FAKE packet (%d bytes)", s.UniqNo, len(data))
-					time.Sleep(30 * time.Millisecond)
+					if err = injectPacket(pkt); err == nil {
+						log.Printf("[%d] Injected FAKE packet (%d bytes)", s.UniqNo, len(data))
+						time.Sleep(30 * time.Millisecond)
+					}
 				} else {
 					fmt.Println("Error generating packet", err)
 				}
@@ -541,6 +545,10 @@ func (s *Socks5) StreamForward() {
 	defer s.targetConn.Close()
 	buffer := make([]byte, 32*1024)
 	fragmenter := NewFragmenter(initialFragSize)
+	var bye *byeWriter
+	if s.Policy.DPI == "bye" {
+		bye = newByeWriter(s.targetConn, s.sessionConfig().Bye)
+	}
 	tlsBuffer := make([]byte, 0, 64*1024)
 	inspectionDone := false
 	probeStarted := false
@@ -587,7 +595,9 @@ func (s *Socks5) StreamForward() {
 			}
 
 			var writeErr error
-			if s.Policy.DPI == "fragment" && fragmenter.ShouldFragment() {
+			if bye != nil {
+				writeErr = bye.Write(data)
+			} else if s.Policy.DPI == "fragment" && fragmenter.ShouldFragment() {
 				writeErr = fragmenter.WriteFragmented(s.targetConn, data)
 			} else {
 				writeErr = writeConn(s.targetConn, data)
@@ -615,9 +625,12 @@ func (s *Socks5) injectFakePacket(tlsRecord *libtls.TLSRecord) {
 	if !ok || hostname == "" {
 		return
 	}
-	decoyName := hostname[:len(hostname)-1] + "x"
-	tlsRecord.Message.ReplaceSNI(decoyName)
-	data, err := tlsRecord.EncodeTLS()
+	originalSize := int(tlsRecord.Length) + 5
+	decoyName := s.Policy.FakeSNI(s.sessionConfig().FakeSni.Decoy, hostname)
+	// Reserve 32 bytes for the TCP header, including the timestamp option
+	// negotiated by current Windows and Linux TCP stacks.
+	maxTLSPayload := CaptureMTU - 20 - 32
+	data, helloSource, err := buildFakeClientHello(tlsRecord, decoyName, maxTLSPayload)
 	if err != nil {
 		log.Printf("[%d] event=fake_sni_encode_failed error=%v", s.UniqNo, err)
 		return
@@ -639,9 +652,29 @@ func (s *Socks5) injectFakePacket(tlsRecord *libtls.TLSRecord) {
 		log.Printf("[%d] event=fake_sni_packet_failed error=%v", s.UniqNo, err)
 		return
 	}
-	SerSentBuffer <- packet
-	log.Printf("[%d] event=fake_sni_injected bytes=%d ttl=%d", s.UniqNo, len(data), ttl)
+	if err := injectPacket(packet); err != nil {
+		log.Printf("[%d] event=fake_sni_injection_failed error=%v", s.UniqNo, err)
+		return
+	}
+	log.Printf("[%d] event=fake_sni_injected sni=%s decoy=%s hello_source=%s bytes=%d original_bytes=%d mtu=%d ttl=%d", s.UniqNo, hostname, decoyName, helloSource, len(data), originalSize, CaptureMTU, ttl)
 	time.Sleep(30 * time.Millisecond)
+}
+
+func buildFakeClientHello(original *libtls.TLSRecord, decoyName string, maxSize int) ([]byte, string, error) {
+	clone := original.Clone()
+	clone.Message.ReplaceSNI(decoyName)
+	data, err := clone.EncodeTLS()
+	if err == nil && len(data) <= maxSize {
+		return data, "client", nil
+	}
+	data, generatedErr := libtls.GenerateClientHello(decoyName, maxSize)
+	if generatedErr != nil {
+		if err != nil {
+			return nil, "", fmt.Errorf("encode client fingerprint: %v; generate fallback: %w", err, generatedErr)
+		}
+		return nil, "", generatedErr
+	}
+	return data, "generated", nil
 }
 
 func (s *Socks5) monitorBlockCandidate(host string, clientHello []byte) {
@@ -674,6 +707,45 @@ func (s *Socks5) monitorBlockCandidate(host string, clientHello []byte) {
 	if ProxyMetrics != nil {
 		ProxyMetrics.FallbackResult("block_candidate", s.Policy.Fallback)
 	}
+	probeTimeout := cfg.Detection.FallbackProbeTimeout()
+	if s.Policy.DPI != "bye" {
+		ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+		err := s.probeDirectBye(ctx, clientHello)
+		cancel()
+		if err == nil {
+			select {
+			case <-s.firstResponse:
+				retryAfter = time.Time{}
+				log.Printf("[%d] event=bye_ignored reason=direct_response_received host=%s", s.UniqNo, host)
+				return
+			default:
+			}
+			if LearnedRoutes != nil {
+				added, evicted, learnErr := LearnedRoutes.AddRouteWithLimit(host, routing.RouteBye, "", "direct-timeout-bye-success", cfg.Detection.LearnedLimit())
+				if learnErr == nil {
+					retryAfter = time.Time{}
+					if evicted != nil {
+						log.Printf("[%d] event=learned_domain_evicted host=%s replacement=%s", s.UniqNo, evicted.Host, host)
+					}
+					log.Printf("[%d] event=bye_success host=%s learned=%t", s.UniqNo, host, added)
+					if ProxyMetrics != nil {
+						ProxyMetrics.FallbackResult("bye_success", s.Policy.Fallback)
+						ProxyMetrics.SetLearnedRoutes(len(LearnedRoutes.Entries()))
+					}
+					s.targetConn.Close()
+					s.clientConn.Close()
+					return
+				}
+				log.Printf("[%d] event=learned_domain_write_failed host=%s route=%s error=%v", s.UniqNo, host, routing.RouteBye, learnErr)
+			}
+		} else {
+			log.Printf("[%d] event=bye_probe_failed host=%s error=%v", s.UniqNo, host, err)
+			if ProxyMetrics != nil {
+				ProxyMetrics.FallbackResult("bye_failed", s.Policy.Fallback)
+			}
+		}
+	}
+
 	_, ok := cfg.Upstreams[s.Policy.Fallback]
 	if !ok {
 		log.Printf("[%d] event=fallback_configuration_error upstream=%s", s.UniqNo, s.Policy.Fallback)
@@ -682,7 +754,6 @@ func (s *Socks5) monitorBlockCandidate(host string, clientHello []byte) {
 		}
 		return
 	}
-	probeTimeout := cfg.Detection.FallbackProbeTimeout()
 	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 	defer cancel()
 	probeConn, err := s.dialUpstreamContext(ctx, s.Policy.Fallback, s.TargetHost, s.TargetPort)
@@ -747,6 +818,33 @@ func (s *Socks5) monitorBlockCandidate(host string, clientHello []byte) {
 	// attempt finish promptly; the next connection uses the learned upstream.
 	s.targetConn.Close()
 	s.clientConn.Close()
+}
+
+func (s *Socks5) probeDirectBye(ctx context.Context, clientHello []byte) error {
+	target := s.TargetHost
+	if s.ConnTargetIP != "" {
+		target = s.ConnTargetIP
+	}
+	address := net.JoinHostPort(target, strconv.Itoa(int(s.TargetPort)))
+	conn, err := directDialContext(ctx, "tcp", address)
+	if err != nil {
+		return fmt.Errorf("direct bye connect: %w", err)
+	}
+	defer conn.Close()
+	deadline, ok := ctx.Deadline()
+	if ok {
+		if err := conn.SetDeadline(deadline); err != nil {
+			return err
+		}
+	}
+	if err := sendByeClientHello(conn, clientHello, s.sessionConfig().Bye); err != nil {
+		return fmt.Errorf("direct bye write: %w", err)
+	}
+	response := make([]byte, 1)
+	if _, err := io.ReadFull(conn, response); err != nil {
+		return fmt.Errorf("direct bye response: %w", err)
+	}
+	return nil
 }
 
 func writeConn(conn net.Conn, data []byte) error {

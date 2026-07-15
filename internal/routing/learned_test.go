@@ -1,6 +1,7 @@
 package routing
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -33,6 +34,51 @@ func TestStorePersistsExactHosts(t *testing.T) {
 	entry, ok := reloaded.Lookup("www.example.com")
 	if !ok || entry.Upstream != "vpn-2" {
 		t.Fatalf("reloaded entry = %#v, %v", entry, ok)
+	}
+}
+
+func TestStoreLoadsLegacyAndPersistsByeRoute(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "learned.yml")
+	legacy := []byte("version: 1\ndomains:\n- host: old.example\n  upstream: vpn\n  learned-at: 2026-01-01T00:00:00Z\n")
+	if err := os.WriteFile(path, legacy, 0600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, ok := store.Lookup("old.example")
+	if !ok || old.Route != RouteSOCKS5 || old.Upstream != "vpn" {
+		t.Fatalf("legacy route = %#v, %v", old, ok)
+	}
+	added, _, err := store.AddRouteWithLimit("bye.example", RouteBye, "", "test", 0)
+	if err != nil || !added {
+		t.Fatalf("AddRouteWithLimit() = %v, %v", added, err)
+	}
+	reloaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bye, ok := reloaded.Lookup("bye.example")
+	if !ok || bye.Route != RouteBye || bye.Upstream != "" {
+		t.Fatalf("bye route = %#v, %v", bye, ok)
+	}
+}
+
+func TestStoreReplacesByeWithSOCKS5(t *testing.T) {
+	store, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if added, _, err := store.AddRouteWithLimit("example.com", RouteBye, "", "bye", 0); err != nil || !added {
+		t.Fatalf("add bye = %v, %v", added, err)
+	}
+	if added, _, err := store.AddWithLimit("example.com", "vpn", "fallback", 0); err != nil || !added {
+		t.Fatalf("replace with SOCKS5 = %v, %v", added, err)
+	}
+	entry, _ := store.Lookup("example.com")
+	if entry.Route != RouteSOCKS5 || entry.Upstream != "vpn" {
+		t.Fatalf("route = %#v", entry)
 	}
 }
 

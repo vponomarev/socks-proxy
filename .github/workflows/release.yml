@@ -32,14 +32,20 @@ jobs:
       - name: Run tests
         run: CGO_ENABLED=0 go test ./...
 
+      - name: Install libpcap build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+
       - name: Build portable binaries
         shell: bash
         run: |
           mkdir -p dist
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildvcs=false -trimpath -ldflags="-s -w" -o dist/socks-proxy-linux-amd64 ./cmd
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -buildvcs=false -trimpath -ldflags="-s -w" -o dist/socks-proxy-linux-amd64-pcap ./cmd
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -buildvcs=false -trimpath -ldflags="-s -w" -o dist/socks-proxy-windows-amd64.exe ./cmd
           cp cmd/proxy.example.yml dist/proxy.example.yml
           cp cmd/vpn-proxy.example.yml dist/vpn-proxy.example.yml
+          cp cmd/fake-sni.example.yml dist/fake-sni.example.yml
+          cp FAKE_SNI.md dist/FAKE_SNI.md
           (cd dist && sha256sum socks-proxy-* > SHA256SUMS)
 
       - name: Publish GitHub release
@@ -48,9 +54,12 @@ jobs:
         run: |
           gh release create "${GITHUB_REF_NAME}" \
             dist/socks-proxy-linux-amd64 \
+            dist/socks-proxy-linux-amd64-pcap \
             dist/socks-proxy-windows-amd64.exe \
             dist/proxy.example.yml \
             dist/vpn-proxy.example.yml \
+            dist/fake-sni.example.yml \
+            dist/FAKE_SNI.md \
             dist/SHA256SUMS \
             --verify-tag \
             --title "${GITHUB_REF_NAME}" \

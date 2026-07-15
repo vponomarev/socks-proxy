@@ -3,9 +3,55 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"testing"
 	"time"
 )
+
+func TestValidateFakeSNIMTU(t *testing.T) {
+	for _, mtu := range []int{1, 575, 65536} {
+		cfg := Config{FakeSni: FakeSni{MTU: mtu}, Default: DefaultPolicy{Egress: "direct", DPI: "none"}}
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("Validate accepted fake-sni MTU %d", mtu)
+		}
+	}
+	for _, mtu := range []int{0, 576, 1500, 65535} {
+		cfg := Config{FakeSni: FakeSni{MTU: mtu}, Default: DefaultPolicy{Egress: "direct", DPI: "none"}}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate rejected fake-sni MTU %d: %v", mtu, err)
+		}
+	}
+}
+
+func TestPolicyForUsesPerDomainFakeSNI(t *testing.T) {
+	actions := map[string]string{"fake-sni": "allowed.example", "ttl": "5"}
+	cfg := Config{Strategy: []Strategy{{
+		Name:   "fake",
+		Egress: "direct",
+		DPI:    "fake-sni",
+		Params: map[string]string{"ttl": "7"},
+		ListRecords: []DomainRecord{{
+			Regexp:  mustPattern(t, "blocked.example"),
+			Actions: &actions,
+		}},
+	}}}
+	policy := cfg.PolicyFor("blocked.example", "", "")
+	if got := policy.FakeSNI("global.example", "blocked.example"); got != "allowed.example" {
+		t.Fatalf("FakeSNI() = %q", got)
+	}
+	if got := policy.TTL(9); got != 5 {
+		t.Fatalf("TTL() = %d", got)
+	}
+}
+
+func mustPattern(t *testing.T, value string) *regexp.Regexp {
+	t.Helper()
+	pattern, err := TemplateToRegex(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pattern
+}
 
 func TestPolicyForStaticSocksWinsOverLearnedRoute(t *testing.T) {
 	dir := t.TempDir()
@@ -36,7 +82,7 @@ strategy:
 	if err != nil {
 		t.Fatal(err)
 	}
-	policy := cfg.PolicyFor("api.example.com", "vpn")
+	policy := cfg.PolicyFor("api.example.com", "socks5", "vpn")
 	if policy.Egress != "socks5" || policy.Upstream != "segment" || policy.Name != "fixed-segment" {
 		t.Fatalf("PolicyFor() = %#v", policy)
 	}
@@ -48,7 +94,7 @@ func TestPolicyForLearnedRouteReplacesDirect(t *testing.T) {
 		Detection: Detection{FallbackUpstream: "vpn"},
 		Default:   DefaultPolicy{Egress: "direct", DPI: "none"},
 	}
-	policy := cfg.PolicyFor("example.com", "vpn")
+	policy := cfg.PolicyFor("example.com", "socks5", "vpn")
 	if policy.Egress != "socks5" || policy.Upstream != "vpn" || policy.Name != "learned-domain" {
 		t.Fatalf("PolicyFor() = %#v", policy)
 	}
@@ -60,9 +106,38 @@ func TestPolicyCanDisableFallback(t *testing.T) {
 		Detection: Detection{FallbackUpstream: "vpn"},
 		Default:   DefaultPolicy{Egress: "direct", DPI: "none", Fallback: "none"},
 	}
-	policy := cfg.PolicyFor("example.com", "vpn")
+	policy := cfg.PolicyFor("example.com", "socks5", "vpn")
 	if policy.Egress != "direct" {
 		t.Fatalf("PolicyFor() = %#v; want direct", policy)
+	}
+}
+
+func TestPolicyForLearnedByeRoute(t *testing.T) {
+	cfg := &Config{
+		Upstreams: map[string]Upstream{"vpn": {Address: "vpn:1080"}},
+		Detection: Detection{FallbackUpstream: "vpn"},
+		Default:   DefaultPolicy{Egress: "direct", DPI: "none"},
+	}
+	policy := cfg.PolicyFor("example.com", "direct+bye", "")
+	if policy.Name != "learned-domain-bye" || policy.Egress != "direct" || policy.DPI != "bye" || policy.Fallback != "vpn" {
+		t.Fatalf("PolicyFor() = %#v", policy)
+	}
+}
+
+func TestByeDefaultsAndValidation(t *testing.T) {
+	bye := Bye{}
+	if bye.SplitMode() != "tcp-split" || bye.Offset() != 3 || bye.SplitDelay() != 15*time.Millisecond {
+		t.Fatalf("bye defaults = mode %q offset %d delay %v", bye.SplitMode(), bye.Offset(), bye.SplitDelay())
+	}
+	for _, invalid := range []Bye{{Mode: "raw"}, {SplitOffset: -1}, {Delay: "2s"}} {
+		cfg := Config{Bye: invalid, Default: DefaultPolicy{Egress: "direct", DPI: "none"}}
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("Validate accepted %#v", invalid)
+		}
+	}
+	cfg := Config{Bye: Bye{Mode: "tlsrec", SplitOffset: 5, Delay: "20ms"}, Default: DefaultPolicy{Egress: "direct", DPI: "bye"}}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate rejected bye config: %v", err)
 	}
 }
 

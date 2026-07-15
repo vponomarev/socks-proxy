@@ -9,6 +9,9 @@ admin:
   address: "127.0.0.1"
   port: 9090
 
+# Raw fake-SNI is optional and requires the libpcap-enabled binary. See
+# fake-sni.example.yml for a complete Linux configuration.
+
 # Configure any number of named SOCKS5 upstreams. The same binary can run as
 # the VPN upstream with the minimal vpn-proxy.example.yml configuration.
 upstreams:
@@ -25,6 +28,13 @@ upstream-health:
   timeout: 5s
   failure-threshold: 3
   cooldown: 30s
+
+# Automatic direct+bye probes split the ClientHello inside SNI using two
+# ordinary TCP writes. tlsrec is an alternative for TLS-record-aware DPI.
+bye:
+  mode: tcp-split
+  split-offset: 3
+  delay: 15ms
 
 detection:
   first-response-timeout: 3s
@@ -58,3 +68,11 @@ strategy:
     egress: direct
     dpi: fragment
     fallback: vpn
+
+  # This optional static policy applies the same technique without waiting
+  # for automatic detection and learning.
+  # - name: bye-direct
+  #   list: "example-lists/bye.txt"
+  #   egress: direct
+  #   dpi: bye
+  #   fallback: vpn

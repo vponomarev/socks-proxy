@@ -177,6 +177,7 @@ func (a *API) learned(w http.ResponseWriter, r *http.Request) {
 func (a *API) addLearned(w http.ResponseWriter, r *http.Request) {
 	var request struct {
 		Host     string `json:"host"`
+		Route    string `json:"route"`
 		Upstream string `json:"upstream"`
 		Reason   string `json:"reason"`
 	}
@@ -186,14 +187,19 @@ func (a *API) addLearned(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid JSON body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	manager := a.currentUpstreams()
-	if manager == nil {
-		http.Error(w, "upstream manager is unavailable", http.StatusServiceUnavailable)
-		return
+	if request.Route == "" {
+		request.Route = routing.RouteSOCKS5
 	}
-	if _, exists := manager.State(request.Upstream); !exists {
-		http.Error(w, "unknown upstream", http.StatusBadRequest)
-		return
+	if request.Route == routing.RouteSOCKS5 {
+		manager := a.currentUpstreams()
+		if manager == nil {
+			http.Error(w, "upstream manager is unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		if _, exists := manager.State(request.Upstream); !exists {
+			http.Error(w, "unknown upstream", http.StatusBadRequest)
+			return
+		}
 	}
 	reason := request.Reason
 	if reason == "" {
@@ -203,7 +209,7 @@ func (a *API) addLearned(w http.ResponseWriter, r *http.Request) {
 	if a.limitProvider != nil {
 		limit = a.limitProvider()
 	}
-	added, evicted, err := a.routes.AddWithLimit(request.Host, request.Upstream, reason, limit)
+	added, evicted, err := a.routes.AddRouteWithLimit(request.Host, request.Route, request.Upstream, reason, limit)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -243,7 +249,7 @@ const dashboardHTML = `<!doctype html>
 <div class="cards" id="cards"></div><h2>Upstreams</h2><table><thead><tr><th>Name</th><th>Address</th><th>Health</th><th>Circuit</th><th>Failures</th><th>Last check</th><th>Error</th></tr></thead><tbody id="upstreams"></tbody></table>
 <h2>Routing</h2><table><thead><tr><th>Policy / egress / upstream</th><th>Connections</th></tr></thead><tbody id="decisions"></tbody></table>
 <h2>Fallback</h2><table><thead><tr><th>Outcome / upstream</th><th>Events</th></tr></thead><tbody id="fallback"></tbody></table>
-<h2>Learned domains</h2><table><thead><tr><th>Host</th><th>Upstream</th><th>Learned</th><th>Last used</th><th>Hits</th><th></th></tr></thead><tbody id="routes"></tbody></table>
+<h2>Learned domains</h2><table><thead><tr><th>Host</th><th>Route</th><th>Upstream</th><th>Learned</th><th>Last used</th><th>Hits</th><th></th></tr></thead><tbody id="routes"></tbody></table>
 <script>
 const fmt=n=>Number(n||0).toLocaleString(); const age=s=>s?new Date(s).toLocaleString():'—'; const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 async function removeHost(host){if(!confirm('Delete learned route '+host+'?'))return;await fetch('/api/learned?host='+encodeURIComponent(host),{method:'DELETE'});load()}
@@ -253,7 +259,7 @@ const cards=[['Active',s.sessions_active],['Sessions',s.sessions_started],['Comp
 document.querySelector('#cards').innerHTML=cards.map(x=>'<div class="card"><div class="muted">'+x[0]+'</div><div class="value">'+fmt(x[1])+'</div></div>').join('');
 document.querySelector('#upstreams').innerHTML=(d.upstreams||[]).map(x=>'<tr><td>'+esc(x.name)+'</td><td>'+esc(x.address)+'</td><td>'+esc(x.health)+'</td><td>'+esc(x.circuit)+'</td><td>'+fmt(x.consecutive_failures)+'</td><td>'+age(x.last_check)+'</td><td>'+esc(x.last_error)+'</td></tr>').join('');
 const rows=o=>Object.entries(o||{}).sort().map(x=>'<tr><td>'+esc(x[0])+'</td><td>'+fmt(x[1])+'</td></tr>').join('');document.querySelector('#decisions').innerHTML=rows(s.route_decisions);document.querySelector('#fallback').innerHTML=rows(s.fallback_results);
-document.querySelector('#routes').innerHTML=d.learned.map(x=>'<tr><td>'+esc(x.host)+'</td><td>'+esc(x.upstream)+'</td><td>'+age(x.learned_at)+'</td><td>'+age(x.last_used_at)+'</td><td>'+fmt(x.hit_count)+'</td><td><button data-host="'+encodeURIComponent(x.host)+'">Delete</button></td></tr>').join('');
+document.querySelector('#routes').innerHTML=d.learned.map(x=>'<tr><td>'+esc(x.host)+'</td><td>'+esc(x.route)+'</td><td>'+esc(x.upstream)+'</td><td>'+age(x.learned_at)+'</td><td>'+age(x.last_used_at)+'</td><td>'+fmt(x.hit_count)+'</td><td><button data-host="'+encodeURIComponent(x.host)+'">Delete</button></td></tr>').join('');
 document.querySelectorAll('button[data-host]').forEach(b=>b.onclick=()=>removeHost(decodeURIComponent(b.dataset.host)));}
 document.querySelector('#reload').onclick=reloadConfig;
 load();setInterval(load,5000);

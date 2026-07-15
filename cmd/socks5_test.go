@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"io"
 	"net"
 	"testing"
 	"time"
 
 	"github.com/vponomarev/socks-proxy/internal/config"
+	"github.com/vponomarev/socks-proxy/internal/libtls"
 	"github.com/vponomarev/socks-proxy/internal/routing"
 )
 
@@ -33,10 +36,14 @@ func TestBlockCandidateLearnsSuccessfulFallback(t *testing.T) {
 	address, stop := startTestSOCKS5(t, []byte("client hello"))
 	defer stop()
 
-	oldConfig, oldRoutes := Cfg, LearnedRoutes
+	oldConfig, oldRoutes, oldDirectDialContext := Cfg, LearnedRoutes, directDialContext
 	t.Cleanup(func() {
 		Cfg, LearnedRoutes = oldConfig, oldRoutes
+		directDialContext = oldDirectDialContext
 	})
+	directDialContext = func(context.Context, string, string) (net.Conn, error) {
+		return nil, errors.New("direct probe unavailable")
+	}
 	Cfg = &config.Config{
 		Upstreams: map[string]config.Upstream{
 			"vpn": {Address: address, ConnectTimeout: "1s"},
@@ -69,7 +76,59 @@ func TestBlockCandidateLearnsSuccessfulFallback(t *testing.T) {
 	session.monitorBlockCandidate("example.com", []byte("client hello"))
 
 	entry, ok := LearnedRoutes.Lookup("example.com")
-	if !ok || entry.Upstream != "vpn" {
+	if !ok || entry.Route != routing.RouteSOCKS5 || entry.Upstream != "vpn" {
+		t.Fatalf("learned route = %#v, %v", entry, ok)
+	}
+}
+
+func TestBlockCandidateLearnsSuccessfulBye(t *testing.T) {
+	hello, err := libtls.GenerateClientHello("example.com", 1400)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldConfig, oldRoutes, oldDirectDialContext := Cfg, LearnedRoutes, directDialContext
+	t.Cleanup(func() {
+		Cfg, LearnedRoutes = oldConfig, oldRoutes
+		directDialContext = oldDirectDialContext
+	})
+	Cfg = &config.Config{
+		Bye:       config.Bye{Mode: "tcp-split", Delay: "0s"},
+		Detection: config.Detection{FirstResponseTimeout: "1ms", ProbeTimeout: "1s"},
+	}
+	LearnedRoutes, err = routing.Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	directDialContext = func(context.Context, string, string) (net.Conn, error) {
+		client, server := net.Pipe()
+		go func() {
+			defer server.Close()
+			payload := make([]byte, len(hello))
+			if _, readErr := io.ReadFull(server, payload); readErr == nil {
+				server.Write([]byte{0x16})
+			}
+		}()
+		return client, nil
+	}
+
+	clientConn, clientPeer := net.Pipe()
+	targetConn, targetPeer := net.Pipe()
+	defer clientPeer.Close()
+	defer targetPeer.Close()
+	session := &Socks5{
+		UniqNo:        2,
+		TargetHost:    "example.com",
+		TargetPort:    443,
+		ConnTargetIP:  "203.0.113.10",
+		clientConn:    clientConn,
+		targetConn:    targetConn,
+		Policy:        config.ResolvedPolicy{Egress: "direct", Fallback: "vpn"},
+		firstResponse: make(chan struct{}),
+	}
+	session.monitorBlockCandidate("example.com", hello)
+
+	entry, ok := LearnedRoutes.Lookup("example.com")
+	if !ok || entry.Route != routing.RouteBye || entry.Upstream != "" {
 		t.Fatalf("learned route = %#v, %v", entry, ok)
 	}
 }

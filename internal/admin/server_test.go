@@ -69,6 +69,15 @@ func TestDashboardStatusMetricsAndDelete(t *testing.T) {
 	if entry, ok := store.Lookup("manual.example"); !ok || entry.Reason != "manual-api" {
 		t.Fatalf("manual route = %#v, %v", entry, ok)
 	}
+	byeAdded := httptest.NewRecorder()
+	byeRequest := httptest.NewRequest(http.MethodPost, "/api/learned", strings.NewReader(`{"host":"bye.example","route":"direct+bye"}`))
+	handler.ServeHTTP(byeAdded, byeRequest)
+	if byeAdded.Code != http.StatusOK {
+		t.Fatalf("add bye route = %d %q", byeAdded.Code, byeAdded.Body.String())
+	}
+	if entry, ok := store.Lookup("bye.example"); !ok || entry.Route != routing.RouteBye || entry.Upstream != "" {
+		t.Fatalf("manual bye route = %#v, %v", entry, ok)
+	}
 
 	unknown := httptest.NewRecorder()
 	handler.ServeHTTP(unknown, httptest.NewRequest(http.MethodPost, "/api/learned", strings.NewReader(`{"host":"bad.example","upstream":"missing"}`)))
