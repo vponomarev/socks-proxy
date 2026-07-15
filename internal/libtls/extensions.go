@@ -70,20 +70,11 @@ func (h *ClientHello) FindSNI() (ok bool, hostname string) {
 	if !ok {
 		return false, ""
 	}
-	if len(data) < 2 {
+	hostname, nameType, err := decodeSNI(data)
+	if err != nil || nameType != 0 || hostname == "" {
 		return false, ""
 	}
-
-	length := binary.BigEndian.Uint16(data[0:2])
-	if length == 0 {
-		return false, ""
-	}
-	if len(data) < 2+int(length) {
-		return false, ""
-	}
-
-	hostname = string(data[5 : 2+length])
-	return ok, hostname
+	return true, hostname
 }
 
 func (h *ClientHello) ReplaceSNI(hostname string) (ok bool, id int) {
@@ -114,7 +105,7 @@ func (h *ClientHello) RemoveExtension(id int) (ok bool) {
 	} else if id == len(h.Extensions)-1 {
 		h.Extensions = h.Extensions[:len(h.Extensions)-1]
 	} else {
-		h.Extensions = append(h.Extensions[:id-1], h.Extensions[id+1:]...)
+		h.Extensions = append(h.Extensions[:id], h.Extensions[id+1:]...)
 	}
 
 	return true
@@ -147,7 +138,7 @@ func (he *HelloExtension) DecodeKeyShare() (ks *KeyShare, err error) {
 		return nil, fmt.Errorf("WRONG_EXTENSION_TYPE")
 	}
 
-	if he.Length < 3 {
+	if len(he.Data) < 2 || int(he.Length) != len(he.Data) {
 		return nil, fmt.Errorf("TOO_SHORT")
 	}
 	ks = &KeyShare{
@@ -162,13 +153,14 @@ func (he *HelloExtension) DecodeKeyShare() (ks *KeyShare, err error) {
 		return
 	}
 	ksp := uint16(2)
-	for ksp < ks.KeyShareLength {
-		if ksp+4 >= ks.KeyShareLength {
+	limit := ks.KeyShareLength + 2
+	for ksp < limit {
+		if ksp+4 > limit {
 			return nil, fmt.Errorf("SHORT_EXTENSION")
 		}
 
 		llen := binary.BigEndian.Uint16(he.Data[ksp+2 : ksp+4])
-		if ksp+llen > ks.KeyShareLength {
+		if ksp+4+llen > limit {
 			return nil, fmt.Errorf("INVALID_EXT_LEN")
 		}
 
@@ -182,7 +174,7 @@ func (he *HelloExtension) DecodeKeyShare() (ks *KeyShare, err error) {
 		ks.Extensions = append(ks.Extensions, e)
 		ksp += llen + 4
 	}
-	if ksp != he.Length {
+	if ksp != limit {
 		return nil, fmt.Errorf("EXTENSION_EARLY_END")
 	}
 
@@ -235,7 +227,7 @@ func (k *KeyShare) RemoveExtension(id int) (ok bool) {
 	} else if id == len(k.Extensions)-1 {
 		k.Extensions = k.Extensions[:len(k.Extensions)-1]
 	} else {
-		k.Extensions = append(k.Extensions[:id-1], k.Extensions[id+1:]...)
+		k.Extensions = append(k.Extensions[:id], k.Extensions[id+1:]...)
 	}
 
 	return true

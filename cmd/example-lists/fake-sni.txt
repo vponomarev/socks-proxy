@@ -1,0 +1,4 @@
+# Replace these examples with domains tested on the local provider.
+# Per-domain values override fake-sni.decoy and fake-sni.ttl.
+blocked.example;fake-sni=vpnc.ru,ttl=2
+.blocked-subdomains.example;fake-sni=vpnc.ru,ttl=2

@@ -36,6 +36,8 @@ func (p Proxy) GracefulTimeout() time.Duration {
 type FakeSni struct {
 	Interface string `yaml:"interface"`
 	Ttl       int    `yaml:"ttl"`
+	MTU       int    `yaml:"mtu"`
+	Decoy     string `yaml:"decoy"`
 }
 
 type Upstream struct {
@@ -265,6 +267,9 @@ func (c *Config) normalizeStrategy(s *Strategy) {
 }
 
 func (c *Config) Validate() error {
+	if c.FakeSni.MTU != 0 && (c.FakeSni.MTU < 576 || c.FakeSni.MTU > 65535) {
+		return fmt.Errorf("fake-sni mtu must be between 576 and 65535")
+	}
 	if c.Proxy.ShutdownTimeout != "" {
 		timeout, err := time.ParseDuration(c.Proxy.ShutdownTimeout)
 		if err != nil {
@@ -380,14 +385,14 @@ func (c *Config) PolicyFor(host string, learnedUpstream string) ResolvedPolicy {
 	}
 
 	for _, strategy := range c.Strategy {
-		if strategy.matches(host) {
+		if matched, params := strategy.match(host); matched {
 			policy = ResolvedPolicy{
 				Name:     strategy.Name,
 				Egress:   strategy.Egress,
 				DPI:      strategy.DPI,
 				Upstream: strategy.Upstream,
 				Fallback: strategy.Fallback,
-				Params:   strategy.Params,
+				Params:   params,
 			}
 			break
 		}
@@ -405,14 +410,23 @@ func (c *Config) PolicyFor(host string, learnedUpstream string) ResolvedPolicy {
 	return policy
 }
 
-func (s Strategy) matches(host string) bool {
+func (s Strategy) match(host string) (bool, map[string]string) {
 	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
 	for _, record := range s.ListRecords {
 		if record.Regexp != nil && record.Regexp.MatchString(host) {
-			return true
+			params := make(map[string]string, len(s.Params)+1)
+			for key, value := range s.Params {
+				params[key] = value
+			}
+			if record.Actions != nil {
+				for key, value := range *record.Actions {
+					params[key] = value
+				}
+			}
+			return true, params
 		}
 	}
-	return false
+	return false, nil
 }
 
 func recordsMatch(records []DomainRecord, host string) bool {
@@ -434,6 +448,19 @@ func (p ResolvedPolicy) TTL(defaultTTL int) int {
 		return defaultTTL
 	}
 	return ttl
+}
+
+func (p ResolvedPolicy) FakeSNI(defaultDecoy, original string) string {
+	if p.Params != nil && strings.TrimSpace(p.Params["fake-sni"]) != "" {
+		return strings.TrimSpace(p.Params["fake-sni"])
+	}
+	if strings.TrimSpace(defaultDecoy) != "" {
+		return strings.TrimSpace(defaultDecoy)
+	}
+	if len(original) == 0 {
+		return ""
+	}
+	return original[:len(original)-1] + "x"
 }
 
 func parseDuration(value string, fallback time.Duration) time.Duration {

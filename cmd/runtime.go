@@ -103,8 +103,8 @@ func validateReload(current, next *config.Config) error {
 	if current.Admin != next.Admin {
 		return fmt.Errorf("admin listener settings require restart")
 	}
-	if current.FakeSni.Interface != next.FakeSni.Interface {
-		return fmt.Errorf("fake-sni interface requires restart")
+	if current.FakeSni.Interface != next.FakeSni.Interface || current.FakeSni.MTU != next.FakeSni.MTU {
+		return fmt.Errorf("fake-sni interface and MTU require restart")
 	}
 	if current.Detection.LearnedDomainsFile != next.Detection.LearnedDomainsFile {
 		return fmt.Errorf("learned-domains-file requires restart")

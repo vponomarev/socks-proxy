@@ -3,9 +3,55 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"testing"
 	"time"
 )
+
+func TestValidateFakeSNIMTU(t *testing.T) {
+	for _, mtu := range []int{1, 575, 65536} {
+		cfg := Config{FakeSni: FakeSni{MTU: mtu}, Default: DefaultPolicy{Egress: "direct", DPI: "none"}}
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("Validate accepted fake-sni MTU %d", mtu)
+		}
+	}
+	for _, mtu := range []int{0, 576, 1500, 65535} {
+		cfg := Config{FakeSni: FakeSni{MTU: mtu}, Default: DefaultPolicy{Egress: "direct", DPI: "none"}}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate rejected fake-sni MTU %d: %v", mtu, err)
+		}
+	}
+}
+
+func TestPolicyForUsesPerDomainFakeSNI(t *testing.T) {
+	actions := map[string]string{"fake-sni": "allowed.example", "ttl": "5"}
+	cfg := Config{Strategy: []Strategy{{
+		Name:   "fake",
+		Egress: "direct",
+		DPI:    "fake-sni",
+		Params: map[string]string{"ttl": "7"},
+		ListRecords: []DomainRecord{{
+			Regexp:  mustPattern(t, "blocked.example"),
+			Actions: &actions,
+		}},
+	}}}
+	policy := cfg.PolicyFor("blocked.example", "")
+	if got := policy.FakeSNI("global.example", "blocked.example"); got != "allowed.example" {
+		t.Fatalf("FakeSNI() = %q", got)
+	}
+	if got := policy.TTL(9); got != 5 {
+		t.Fatalf("TTL() = %d", got)
+	}
+}
+
+func mustPattern(t *testing.T, value string) *regexp.Regexp {
+	t.Helper()
+	pattern, err := TemplateToRegex(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pattern
+}
 
 func TestPolicyForStaticSocksWinsOverLearnedRoute(t *testing.T) {
 	dir := t.TempDir()

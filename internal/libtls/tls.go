@@ -8,6 +8,7 @@ import (
 const (
 	TLS_EXTENSION_KEY_SHARE = 51
 	TLS_EXTENSION_ECH       = 65037
+	TLS_EXTENSION_PADDING   = 21
 
 	TLS_KEY_SHARE_X25519MLKEM768 = 4588
 	TLS_KEY_SHARE_x25519         = 29
@@ -92,7 +93,7 @@ func DecodeTLS(data []byte) (record *TLSRecord, err error) {
 		return nil, fmt.Errorf("incomplete TLS record")
 	}
 
-	handshakeData := data[5:] // Skip TLS record header
+	handshakeData := data[5 : 5+int(record.Length)] // Skip TLS record header
 
 	// Parse Handshake Header
 	if len(handshakeData) < 4 {
@@ -112,7 +113,7 @@ func DecodeTLS(data []byte) (record *TLSRecord, err error) {
 		return nil, fmt.Errorf("incomplete handshake message")
 	}
 
-	clientHelloData := handshakeData[4:] // Skip handshake header
+	clientHelloData := handshakeData[4 : 4+int(handshakeHeader.Length)] // Skip handshake header
 	offset := 0
 
 	// Parse ClientHello
@@ -154,6 +155,9 @@ func DecodeTLS(data []byte) (record *TLSRecord, err error) {
 	}
 	hello.CipherSuitesLen = binary.BigEndian.Uint16(clientHelloData[offset:])
 	offset += 2
+	if hello.CipherSuitesLen == 0 || hello.CipherSuitesLen%2 != 0 {
+		return nil, fmt.Errorf("invalid ClientHello cipher suites length: %d", hello.CipherSuitesLen)
+	}
 
 	cipherSuiteCount := int(hello.CipherSuitesLen) / 2
 	hello.CipherSuites = make([]uint16, cipherSuiteCount)
@@ -190,13 +194,16 @@ func DecodeTLS(data []byte) (record *TLSRecord, err error) {
 		offset += 2
 
 		extensionsEnd := offset + int(hello.ExtensionsLength)
+		if extensionsEnd != len(clientHelloData) {
+			return nil, fmt.Errorf("invalid ClientHello extensions length")
+		}
 		for offset < extensionsEnd && offset+4 <= len(clientHelloData) {
 			extType := binary.BigEndian.Uint16(clientHelloData[offset:])
 			offset += 2
 			extLength := binary.BigEndian.Uint16(clientHelloData[offset:])
 			offset += 2
 
-			if offset+int(extLength) > len(clientHelloData) {
+			if offset+int(extLength) > extensionsEnd {
 				return nil, fmt.Errorf("incomplete extension data")
 			}
 
@@ -209,6 +216,9 @@ func DecodeTLS(data []byte) (record *TLSRecord, err error) {
 				Length: extLength,
 				Data:   extData,
 			})
+		}
+		if offset != extensionsEnd {
+			return nil, fmt.Errorf("incomplete extension header")
 		}
 	}
 

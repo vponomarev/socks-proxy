@@ -35,6 +35,7 @@ func TestValidateReload(t *testing.T) {
 		{"proxy listener", func(c *config.Config) { c.Proxy.Port++ }, "proxy address and port"},
 		{"admin listener", func(c *config.Config) { c.Admin.Port++ }, "admin listener"},
 		{"capture interface", func(c *config.Config) { c.FakeSni.Interface = "eth1" }, "fake-sni interface"},
+		{"capture MTU", func(c *config.Config) { c.FakeSni.MTU = 1400 }, "fake-sni interface and MTU"},
 		{"learned store", func(c *config.Config) { c.Detection.LearnedDomainsFile = "other.yml" }, "learned-domains-file"},
 	}
 	for _, tt := range tests {

@@ -9,6 +9,9 @@ admin:
   address: "127.0.0.1"
   port: 9090
 
+# Raw fake-SNI is optional and requires the libpcap-enabled binary. See
+# fake-sni.example.yml for a complete Linux configuration.
+
 # Configure any number of named SOCKS5 upstreams. The same binary can run as
 # the VPN upstream with the minimal vpn-proxy.example.yml configuration.
 upstreams:

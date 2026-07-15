@@ -33,9 +33,15 @@ type Fragmenter struct {
 	totalLimit int
 }
 
+type packetInjectionRequest struct {
+	packet gopacket.SerializeBuffer
+	result chan error
+}
+
 var (
 	RSB             RingSessionBuffer
-	SerSentBuffer   chan gopacket.SerializeBuffer
+	SerSentBuffer   chan packetInjectionRequest
+	CaptureMTU      = 1500
 	paramTTL        = flag.Int("ttl", 7, "TTL for fake packets")
 	configPath      = flag.String("config", "proxy.yml", "Path to config file, default `proxy.yml`")
 	Cfg             *config.Config
@@ -109,7 +115,7 @@ func main() {
 	}
 
 	if Cfg.FakeSni.Interface != "" {
-		okCapture, err, chCapture := setupCapture(appCtx, Cfg.FakeSni.Interface)
+		okCapture, err, chCapture := setupCapture(appCtx, Cfg.FakeSni.Interface, Cfg.FakeSni.MTU)
 		if okCapture {
 			go TrackSessions(chCapture)
 		}

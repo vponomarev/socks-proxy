@@ -521,10 +521,10 @@ func (s *Socks5) DoInject(data []byte) {
 				//}
 				err, pkt := PrepareFakePacket(si, uint8(*paramTTL), fp)
 				if err == nil {
-					SerSentBuffer <- pkt
-
-					log.Printf("[%d] Injected FAKE packet (%d bytes)", s.UniqNo, len(data))
-					time.Sleep(30 * time.Millisecond)
+					if err = injectPacket(pkt); err == nil {
+						log.Printf("[%d] Injected FAKE packet (%d bytes)", s.UniqNo, len(data))
+						time.Sleep(30 * time.Millisecond)
+					}
 				} else {
 					fmt.Println("Error generating packet", err)
 				}
@@ -615,9 +615,12 @@ func (s *Socks5) injectFakePacket(tlsRecord *libtls.TLSRecord) {
 	if !ok || hostname == "" {
 		return
 	}
-	decoyName := hostname[:len(hostname)-1] + "x"
-	tlsRecord.Message.ReplaceSNI(decoyName)
-	data, err := tlsRecord.EncodeTLS()
+	originalSize := int(tlsRecord.Length) + 5
+	decoyName := s.Policy.FakeSNI(s.sessionConfig().FakeSni.Decoy, hostname)
+	// Reserve 32 bytes for the TCP header, including the timestamp option
+	// negotiated by current Windows and Linux TCP stacks.
+	maxTLSPayload := CaptureMTU - 20 - 32
+	data, helloSource, err := buildFakeClientHello(tlsRecord, decoyName, maxTLSPayload)
 	if err != nil {
 		log.Printf("[%d] event=fake_sni_encode_failed error=%v", s.UniqNo, err)
 		return
@@ -639,9 +642,29 @@ func (s *Socks5) injectFakePacket(tlsRecord *libtls.TLSRecord) {
 		log.Printf("[%d] event=fake_sni_packet_failed error=%v", s.UniqNo, err)
 		return
 	}
-	SerSentBuffer <- packet
-	log.Printf("[%d] event=fake_sni_injected bytes=%d ttl=%d", s.UniqNo, len(data), ttl)
+	if err := injectPacket(packet); err != nil {
+		log.Printf("[%d] event=fake_sni_injection_failed error=%v", s.UniqNo, err)
+		return
+	}
+	log.Printf("[%d] event=fake_sni_injected sni=%s decoy=%s hello_source=%s bytes=%d original_bytes=%d mtu=%d ttl=%d", s.UniqNo, hostname, decoyName, helloSource, len(data), originalSize, CaptureMTU, ttl)
 	time.Sleep(30 * time.Millisecond)
+}
+
+func buildFakeClientHello(original *libtls.TLSRecord, decoyName string, maxSize int) ([]byte, string, error) {
+	clone := original.Clone()
+	clone.Message.ReplaceSNI(decoyName)
+	data, err := clone.EncodeTLS()
+	if err == nil && len(data) <= maxSize {
+		return data, "client", nil
+	}
+	data, generatedErr := libtls.GenerateClientHello(decoyName, maxSize)
+	if generatedErr != nil {
+		if err != nil {
+			return nil, "", fmt.Errorf("encode client fingerprint: %v; generate fallback: %w", err, generatedErr)
+		}
+		return nil, "", generatedErr
+	}
+	return data, "generated", nil
 }
 
 func (s *Socks5) monitorBlockCandidate(host string, clientHello []byte) {
